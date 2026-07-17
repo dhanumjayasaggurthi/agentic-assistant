@@ -1,0 +1,20 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: rdi-postgres
+    environment:
+      POSTGRES_DB: rdi_ai
+      POSTGRES_USER: rdi
+      POSTGRES_PASSWORD: rdi_dev_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - rdi_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rdi -d rdi_ai"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  rdi_pgdata:

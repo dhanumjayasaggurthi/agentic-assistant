@@ -1,0 +1,5 @@
+# Runtime secret (auto-generated)
+.jwt_secret
+rdi_ai.db
+__pycache__/
+*.pyc
