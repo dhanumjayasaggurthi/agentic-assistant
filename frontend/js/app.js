@@ -622,7 +622,7 @@ function Composer({ conv, agentMode, model, onOpenModel, onSend, onStop, busy, d
               {m.name || model}
               <Ic.down />
             </button>
-            {agentMode && !imgMode && <span className="tools-pill">15 tools ready</span>}
+            {agentMode && !imgMode && <span className="tools-pill">tools ready</span>}
             <span className="spacer" />
             <button className={'tool-btn' + (recording ? ' rec' : '')} title="Voice input" onClick={toggleRec}><Ic.mic /></button>
             {busy
@@ -1210,7 +1210,7 @@ function App() {
     RdiWS.on('activity', () => {});
     RdiWS.on('activity_done', () => setBusy(false));
     RdiWS.on('cancelled', d => {
-      if (streamRef.current) finalizeStream();
+      if (streamRef.current || runRef.current) finalizeStream();
       setBusy(false);
       setPermission(null);
       pushToast(d.message || 'Run stopped');
