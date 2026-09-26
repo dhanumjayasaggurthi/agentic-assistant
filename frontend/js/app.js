@@ -1197,7 +1197,10 @@ function App() {
     });
     RdiWS.on('model_fallback', d => {
       setFallback(d);
-      pushToast(`${modelName(d.requested)} can't drive tools — run continues on ${modelName(d.fallback)}`);
+      pushToast(`${modelName(d.requested)} is being used as a specialist; orchestration continues on ${modelName(d.fallback)}`);
+    });
+    RdiWS.on('auto_agent_started', d => {
+      pushToast(d.reason || 'Using tools automatically for this request');
     });
     RdiWS.on('permission', d => setPermission(d));
     RdiWS.on('permission_auto', d => pushToast(`auto-approved read-only: ${d.tool}`));
@@ -1331,7 +1334,7 @@ function App() {
     } else {
       RdiWS.send({
         type: 'chat', message: text, model, conversation_id: convId,
-        agent_mode: agentMode && !imgMode, attachments: payloadAtts,
+        agent_mode: agentMode && !imgMode, auto_agent: true, attachments: payloadAtts,
       });
     }
     if (!RdiWS.isConnected()) pushToast('Offline — message queued, will send on reconnect');
