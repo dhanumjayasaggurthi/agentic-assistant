@@ -52,6 +52,7 @@ from .providers.vertex import generate_vertex_image
 # Activity icons per tool
 _TOOL_ICONS: Dict[str, str] = {
     "read_file": "📄", "write_file": "✏️", "create_file": "📝",
+    "patch_file": "🩹", "inspect_image": "👁️", "delegate_code": "🧠",
     "delete_file": "🗑️", "list_files": "📁", "run_bash": "⚡",
     "run_python": "🐍", "search_files": "🔍", "create_pdf": "📑",
     "create_pptx": "📊", "create_docx": "📃", "create_excel": "📈",
@@ -59,10 +60,10 @@ _TOOL_ICONS: Dict[str, str] = {
 }
 
 # Tools that never mutate anything — eligible for auto-approval.
-READONLY_TOOLS = {"read_file", "list_files", "search_files", "web_search", "web_crawl"}
+READONLY_TOOLS = {"read_file", "list_files", "search_files", "web_search", "web_crawl", "inspect_image"}
 
 # Tools that produce files — their outputs get registered as artifacts.
-FILE_TOOLS = {"write_file", "create_file", "create_pdf", "create_pptx",
+FILE_TOOLS = {"write_file", "create_file", "patch_file", "create_pdf", "create_pptx",
               "create_docx", "create_excel", "generate_image"}
 
 # ── Stream state: survives socket drops, owns seq numbering ──────────────────
@@ -1112,6 +1113,9 @@ def _tool_label(tool: str, args: dict) -> str:
     if tool == "run_bash":     return f"Running: {args.get('command', '')[:60]}"
     if tool == "run_python":   return "Running Python code"
     if tool == "search_files": return f"Searching for '{args.get('pattern', '')}'"
+    if tool == "patch_file":   return f"Patching {args.get('path', '')}"
+    if tool == "inspect_image": return f"Inspecting {args.get('path', '')}"
+    if tool == "delegate_code": return "Consulting code specialist"
     if tool == "create_pdf":   return f"Creating PDF: {args.get('filename', '')}"
     if tool == "create_pptx":  return f"Creating PowerPoint: {args.get('filename', '')}"
     if tool == "create_docx":  return f"Creating Word doc: {args.get('filename', '')}"
