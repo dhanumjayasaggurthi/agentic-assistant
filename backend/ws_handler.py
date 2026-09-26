@@ -452,7 +452,14 @@ class WSSession:
         self.history.append({"role": "user", "content": user_msg, "attachments": norm_atts})
         self.history = trim_history(self.history)
 
-        agent_mode = data.get("agent_mode", False)
+        agent_mode = bool(data.get("agent_mode", False))
+        auto_agent = bool(data.get("auto_agent", True))
+        if not agent_mode and auto_agent and _should_auto_agent(user_msg, norm_atts):
+            agent_mode = True
+            await st.emit({
+                "type": "auto_agent_started",
+                "reason": "This request requires tools or workspace actions, so it was promoted to an agent run.",
+            })
         if agent_mode:
             await self._run_coding_agent(user_msg, model, cid, st, attachments=norm_atts)
             return
@@ -978,6 +985,33 @@ class WSSession:
             await self.send({"type": "transcription", "text": text})
         except Exception as exc:
             await self.send_error(f"Transcription error: {exc}")
+
+
+def _should_auto_agent(message: str, attachments: List[Dict]) -> bool:
+    """Conservative tool-intent detector for ChatGPT-like automatic tool use.
+
+    We intentionally avoid sending every normal question through the agent. The
+    promotion only happens for explicit action verbs or file/workspace tasks.
+    """
+    text = (message or "").lower()
+    phrases = (
+        "create a file", "create file", "edit the file", "modify the file",
+        "update the file", "fix the file", "make changes", "implement this",
+        "fix this code", "fix the codebase", "update this repo", "update the repo",
+        "run the code", "run tests", "execute the code", "debug this",
+        "create a powerpoint", "build a powerpoint", "create ppt", "create a pdf",
+        "create pdf", "create docx", "create a word", "create excel", "create xlsx",
+        "search the web", "browse the web", "look up the latest", "research the latest",
+        "use the workspace", "in the workspace", "inspect the attached",
+        "analyze the attached", "edit this image", "modify this image",
+    )
+    if any(p in text for p in phrases):
+        return True
+    if attachments:
+        action_words = ("analyze", "edit", "fix", "modify", "update", "implement", "run", "build")
+        if any(w in text for w in action_words):
+            return True
+    return False
 
 
 # ── Attachment normalization ──────────────────────────────────────────────────
