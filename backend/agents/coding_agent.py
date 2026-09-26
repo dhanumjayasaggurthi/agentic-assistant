@@ -2,13 +2,10 @@
 import asyncio
 import json
 import uuid
-from typing import AsyncGenerator, Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from .tools import TOOL_DEFINITIONS, build_preview, execute_tool
 
-# Coding agent uses GPT-5 Codex or falls back to gpt-4o
-_DEFAULT_CODE_MODEL = "gpt-5.3-codex-global"
-_FALLBACK_MODEL = "gpt-4o-global"
 
 _CODING_SYSTEM = """You are RDI AI Agent, an enterprise-grade action assistant operating in a sandboxed per-conversation workspace.
 
@@ -197,7 +194,7 @@ async def _complete_with_tools(messages: List[Dict], model: str, provider: str) 
             messages=messages,
             tools=TOOL_DEFINITIONS,
             tool_choice="auto",
-            max_completion_tokens=4096,
+            max_completion_tokens=8192,
         )
         choice = resp.choices[0]
         return {
