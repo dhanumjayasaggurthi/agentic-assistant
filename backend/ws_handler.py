@@ -728,6 +728,7 @@ class WSSession:
             })
 
         agent_failed = False
+        cancelled = False
         err_text = None
         try:
             await run_coding_agent(
@@ -738,6 +739,9 @@ class WSSession:
                 pre_tool_callback=_pre_tool_cb,
                 image_fn=_image_fn,
             )
+        except asyncio.CancelledError:
+            cancelled = True
+            err_text = "cancelled by user"
         except Exception as exc:
             agent_failed = True
             err_text = str(exc)
@@ -746,11 +750,21 @@ class WSSession:
             _workspace_var.reset(_tok)
 
         st.running = False
+        st.task = None
         latency = int((time.time() - t0) * 1000)
 
         input_chars = sum(len(str(m.get("content", ""))) for m in self.history[:-1])
         in_toks = max(1, input_chars // 4)
         out_toks = max(1, len(full_response) // 4)
+
+        if cancelled:
+            if full_response:
+                await add_message(cid, "assistant", full_response)
+                self.history.append({"role": "assistant", "content": full_response})
+            await finish_run(run_id, "cancelled", in_toks, out_toks, 0.0, error=err_text)
+            await st.emit({"type": "run_step", "run_id": run_id,
+                           "steps": _public_steps(steps), "final": "cancelled"})
+            return
 
         if agent_failed:
             if full_response:
@@ -830,6 +844,8 @@ class WSSession:
                     result = await generate_image(gen_prompt, model, size)
                     b64 = result.get("b64")
                     url = result.get("url")
+                if not b64 and url:
+                    b64 = await _download_image_b64(url)
                 results.append((b64, url))
                 await st.emit({
                     "type": "image_result",
@@ -850,6 +866,7 @@ class WSSession:
             return
 
         st.running = False
+        st.task = None
         await st.emit({"type": "activity_done"})
 
         try:
@@ -907,6 +924,7 @@ class WSSession:
         st = self._attach_stream(cid)
         st.task = asyncio.current_task()
         st.running = True
+        await add_message(cid, "user", f"Edit {source_name}: {prompt}")
         await st.emit({"type": "activity", "action": "Editing image…", "icon": "🖼️"})
         try:
             raw = image_b64.split(",", 1)[1] if image_b64.startswith("data:") else image_b64
@@ -923,6 +941,8 @@ class WSSession:
                 )
                 b64 = result.get("b64")
                 url = result.get("url")
+                if not b64 and url:
+                    b64 = await _download_image_b64(url)
                 await st.emit({
                     "type": "image_result",
                     "url": url,
@@ -954,6 +974,7 @@ class WSSession:
             await st.emit({"type": "error", "message": f"Image edit error: {exc}"})
         finally:
             st.running = False
+            st.task = None
             await st.emit({"type": "activity_done"})
 
     # ── Text-to-speech ────────────────────────────────────────────────────────
@@ -985,6 +1006,22 @@ class WSSession:
             await self.send({"type": "transcription", "text": text})
         except Exception as exc:
             await self.send_error(f"Transcription error: {exc}")
+
+
+async def _download_image_b64(url: str) -> str:
+    """Normalize temporary provider URLs into durable base64 results."""
+    if not url:
+        return ""
+    loop = asyncio.get_running_loop()
+
+    def _download() -> bytes:
+        import requests
+        resp = requests.get(url, timeout=60)
+        resp.raise_for_status()
+        return resp.content
+
+    raw = await loop.run_in_executor(None, _download)
+    return base64.b64encode(raw).decode()
 
 
 def _should_auto_agent(message: str, attachments: List[Dict]) -> bool:
