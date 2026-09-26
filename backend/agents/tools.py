@@ -2,6 +2,7 @@
 import asyncio
 import contextvars
 import difflib
+import json
 import subprocess
 import sys
 import urllib.parse
@@ -48,6 +49,9 @@ TOOL_DEFINITIONS: List[Dict] = [
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "Relative path within workspace/"},
+                    "start_line": {"type": "integer", "description": "Optional 1-based start line"},
+                    "end_line": {"type": "integer", "description": "Optional 1-based end line"},
+                    "max_chars": {"type": "integer", "description": "Maximum characters to return", "default": 20000},
                 },
                 "required": ["path"],
             },
@@ -166,6 +170,53 @@ TOOL_DEFINITIONS: List[Dict] = [
                 "required": ["pattern"],
             },
         },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "patch_file",
+            "description": "Make a precise text replacement in an existing workspace file. Prefer this over rewriting an entire file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "old_text": {"type": "string", "description": "Exact text to replace"},
+                    "new_text": {"type": "string", "description": "Replacement text"},
+                    "occurrence": {"type": "integer", "description": "1-based occurrence when old_text appears multiple times", "default": 1}
+                },
+                "required": ["path", "old_text", "new_text"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "inspect_image",
+            "description": "Inspect an image already in the workspace with a vision-capable premium model.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Workspace-relative image path"},
+                    "question": {"type": "string", "description": "What to analyze in the image", "default": "Describe the image accurately and identify details relevant to the current task."}
+                },
+                "required": ["path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delegate_code",
+            "description": "Ask the premium Codex code specialist for implementation or debugging help. Use for substantial coding tasks, then apply and verify the result with workspace tools.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task": {"type": "string", "description": "Precise coding task or debugging question"},
+                    "context": {"type": "string", "description": "Relevant code/context already gathered", "default": ""}
+                },
+                "required": ["task"]
+            }
+        }
     },
     # ── Document creation ──────────────────────────────────────────────────────
     {
@@ -365,6 +416,12 @@ def build_preview(tool: str, args: Dict) -> str:
             return compute_diff(old, content, path)
         preview = content[:500] + ("…" if len(content) > 500 else "")
         return f"Create {path}:\n{preview}"
+    if tool == "patch_file":
+        return f"Patch workspace/{args.get('path', '')}: replace {len(args.get('old_text', ''))} chars with {len(args.get('new_text', ''))} chars"
+    if tool == "inspect_image":
+        return f"Inspect image workspace/{args.get('path', '')}: {args.get('question', '')[:120]}"
+    if tool == "delegate_code":
+        return f"Delegate to code specialist: {args.get('task', '')[:160]}"
     if tool == "delete_file":
         return f"Delete workspace/{args.get('path', '')}"
     if tool == "list_files":
@@ -405,6 +462,9 @@ async def execute_tool(tool: str, args: Dict, image_fn=None) -> str:
         if tool == "run_bash":        return await _run_bash(args)
         if tool == "run_python":      return await _run_python(args)
         if tool == "search_files":    return await _search_files(args)
+        if tool == "patch_file":      return await _patch_file(args)
+        if tool == "inspect_image":   return await _inspect_image(args)
+        if tool == "delegate_code":   return await _delegate_code(args)
         if tool == "create_pdf":      return await _create_pdf(args)
         if tool == "create_pptx":     return await _create_pptx(args)
         if tool == "create_docx":     return await _create_docx(args)
@@ -423,7 +483,16 @@ async def _read_file(args: Dict) -> str:
     path = _safe_path(args["path"])
     if not path.exists():
         return f"File not found: {args['path']}"
-    return path.read_text(encoding="utf-8", errors="replace")
+    text = path.read_text(encoding="utf-8", errors="replace")
+    lines = text.splitlines()
+    start = max(1, int(args.get("start_line") or 1))
+    end = int(args.get("end_line") or len(lines))
+    end = max(start, min(end, len(lines)))
+    selected = "\n".join(lines[start - 1:end])
+    max_chars = max(1000, min(int(args.get("max_chars") or 20000), 100000))
+    if len(selected) > max_chars:
+        selected = selected[:max_chars] + "\n...[truncated; request a narrower line range]"
+    return selected
 
 
 async def _write_file(args: Dict) -> str:
@@ -440,6 +509,81 @@ async def _create_file(args: Dict) -> str:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(args["content"], encoding="utf-8")
     return f"Created {args['path']}"
+
+
+async def _patch_file(args: Dict) -> str:
+    path = _safe_path(args["path"])
+    if not path.exists():
+        return f"File not found: {args['path']}"
+    old = args.get("old_text", "")
+    new = args.get("new_text", "")
+    if not old:
+        return "Error: old_text must not be empty"
+    text = path.read_text(encoding="utf-8", errors="replace")
+    matches = []
+    start = 0
+    while True:
+        idx = text.find(old, start)
+        if idx < 0:
+            break
+        matches.append(idx)
+        start = idx + max(1, len(old))
+    if not matches:
+        return "Error: exact old_text was not found; read the relevant range and retry with exact text"
+    occurrence = int(args.get("occurrence") or 1)
+    if occurrence < 1 or occurrence > len(matches):
+        return f"Error: occurrence must be between 1 and {len(matches)}"
+    idx = matches[occurrence - 1]
+    updated = text[:idx] + new + text[idx + len(old):]
+    path.write_text(updated, encoding="utf-8")
+    return (
+        f"Patched {args['path']} occurrence {occurrence}/{len(matches)} "
+        f"({len(old)} chars -> {len(new)} chars)"
+    )
+
+
+async def _inspect_image(args: Dict) -> str:
+    import base64 as _b64
+    import mimetypes
+    path = _safe_path(args["path"])
+    if not path.exists():
+        return f"File not found: {args['path']}"
+    mime = mimetypes.guess_type(path.name)[0] or "image/png"
+    if not mime.startswith("image/"):
+        return f"Error: {args['path']} is not an image"
+    b64 = _b64.b64encode(path.read_bytes()).decode()
+    question = args.get("question") or "Describe the image accurately."
+    messages = [{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": question},
+            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
+        ],
+    }]
+    from ..providers.azure_chat import stream_chat
+    chunks = []
+    async for token in stream_chat(messages, "gpt-4.1-global", max_tokens=3000):
+        chunks.append(token)
+    return "".join(chunks)
+
+
+async def _delegate_code(args: Dict) -> str:
+    from ..config import get_config
+    cfg = get_config()
+    if not cfg.azure_gpt5:
+        return "Error: GPT-5/Codex gateway is not configured"
+    task = args.get("task", "").strip()
+    context = args.get("context", "")
+    prompt = (
+        "You are a code specialist working inside a larger agent. "
+        "Return implementation-ready guidance or code. Be explicit about assumptions, "
+        "edge cases, and validation. Do not claim files were changed.\n\n"
+        f"TASK:\n{task}\n\n"
+    )
+    if context:
+        prompt += f"CONTEXT:\n{context[:60000]}"
+    from ..providers.azure_gpt5 import codex_responses_api
+    return await codex_responses_api("gpt-5.3-codex-global", prompt, max_output_tokens=8000)
 
 
 async def _delete_file(args: Dict) -> str:
