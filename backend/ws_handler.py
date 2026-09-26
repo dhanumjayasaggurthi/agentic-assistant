@@ -885,6 +885,7 @@ class WSSession:
         size = data.get("size", "1024x1024")
         model = data.get("model", "gpt-image-1-global")
         source_name = data.get("source_name", "image.png")
+        count = max(1, min(int(data.get("count", 1) or 1), 4))
         cid = data.get("conversation_id") or self.conversation_id
 
         if not prompt or not image_b64:
@@ -905,38 +906,41 @@ class WSSession:
             mask_raw = None
             if mask_b64:
                 mask_raw = mask_b64.split(",", 1)[1] if mask_b64.startswith("data:") else mask_b64
-            result = await edit_image(
-                base64.b64decode(raw),
-                base64.b64decode(mask_raw) if mask_raw else None,
-                prompt,
-                model=model,
-                size=size,
-            )
-            b64 = result.get("b64")
-            url = result.get("url")
-            await st.emit({
-                "type": "image_result",
-                "url": url,
-                "base64": b64,
-                "prompt": f"Edited {source_name}: {prompt}",
-                "model": model,
-                "edited_from": source_name,
-            })
-            if b64:
-                await self._load_ws_settings()
-                fname = f"edited_{int(time.time())}.png"
-                img_dir = self._conv_workspace(cid) / "images"
-                img_dir.mkdir(parents=True, exist_ok=True)
-                (img_dir / fname).write_bytes(base64.b64decode(b64))
-                await register_artifact(
-                    cid, fname, f"images/{fname}", kind="image",
-                    size_bytes=(img_dir / fname).stat().st_size,
-                    meta={"edit_prompt": prompt, "source": source_name, "model": model},
+            for idx in range(count):
+                result = await edit_image(
+                    base64.b64decode(raw),
+                    base64.b64decode(mask_raw) if mask_raw else None,
+                    prompt,
+                    model=model,
+                    size=size,
                 )
-                await add_message(
-                    cid, "assistant", f"[Edited image: {source_name}]",
-                    attachments=[{"name": fname, "type": "image/png", "content": b64}],
-                )
+                b64 = result.get("b64")
+                url = result.get("url")
+                await st.emit({
+                    "type": "image_result",
+                    "url": url,
+                    "base64": b64,
+                    "prompt": f"Edited {source_name}: {prompt}",
+                    "model": model,
+                    "edited_from": source_name,
+                    "variation_index": idx,
+                    "variation_count": count,
+                })
+                if b64:
+                    await self._load_ws_settings()
+                    fname = f"edited_{int(time.time())}_{idx + 1}.png"
+                    img_dir = self._conv_workspace(cid) / "images"
+                    img_dir.mkdir(parents=True, exist_ok=True)
+                    (img_dir / fname).write_bytes(base64.b64decode(b64))
+                    await register_artifact(
+                        cid, fname, f"images/{fname}", kind="image",
+                        size_bytes=(img_dir / fname).stat().st_size,
+                        meta={"edit_prompt": prompt, "source": source_name, "model": model},
+                    )
+                    await add_message(
+                        cid, "assistant", f"[Edited image: {source_name}]",
+                        attachments=[{"name": fname, "type": "image/png", "content": b64}],
+                    )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
