@@ -33,7 +33,7 @@ def _client() -> AsyncAzureOpenAI:
 async def stream_gpt5(
     messages: List[dict],
     model: str,
-    max_tokens: int = 4096,
+    max_tokens: int = 8192,
 ) -> AsyncGenerator[str, None]:
     if model in _CODEX_MODELS:
         prompt = _messages_to_prompt(messages)
@@ -56,7 +56,7 @@ async def stream_gpt5(
                 yield chunk.choices[0].delta.content
 
 
-async def codex_responses_api(model: str, prompt: str, max_output_tokens: int = 4096) -> str:
+async def codex_responses_api(model: str, prompt: str, max_output_tokens: int = 8192) -> str:
     """Codex: POST {gpt5_endpoint}/openai/v1/responses."""
     cfg = get_config().azure_gpt5
     if not cfg:

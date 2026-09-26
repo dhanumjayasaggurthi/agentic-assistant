@@ -96,7 +96,13 @@ const ALL_MODELS = MODEL_GROUPS.flatMap(g => g.models);
 const modelById = id => ALL_MODELS.find(m => m.id === id);
 const modelName = id => (modelById(id) || {}).name || id;
 const isImageModel = id => (modelById(id) || {}).type === 'image';
-const isNoToolsModel = id => !!(modelById(id) || {}).noTools;
+const isNoToolsModel = id => {
+  const m = (id || '').toLowerCase();
+  if ((modelById(id) || {}).noTools) return true;
+  if (m.startsWith('o1') || m.startsWith('o3') || m.startsWith('o4')) return true;
+  if (m.startsWith('gemini-') && m !== 'gemini-2.5-flash-image') return true;
+  return false;
+};
 
 const TIER_COLORS = { budget: '#1B7F4D', standard: '#B45309', premium: '#6B5CD6', ultra: '#E11900' };
 const TIERS = ['all', 'budget', 'standard', 'premium', 'ultra'];
@@ -367,7 +373,7 @@ function ModelPalette({ open, onClose, current, onPick, agentMode }) {
                   <span className="model-dot" style={{ background: TIER_COLORS[m.tier] }} />
                   <span className="model-name">{m.name}</span>
                   <span className="model-id">{m.id}</span>
-                  {m.noTools && <span className="no-tools-badge" title="No function-calling — can't drive Agent tools">NO TOOLS</span>}
+                  {isNoToolsModel(m.id) && <span className="no-tools-badge" title="This integration uses a separate tool-capable orchestrator for Agent mode">SPECIALIST</span>}
                   <span className="model-tier" style={{ color: TIER_COLORS[m.tier] }}>{m.tier.toUpperCase()}</span>
                 </div>
               ))}
@@ -587,7 +593,7 @@ function Composer({ conv, agentMode, model, onOpenModel, onSend, onStop, busy, d
           <div className="guard-banner">
             <span className="sq" />
             <span style={{ flex: 1 }}>
-              <strong>{modelName(guard)}</strong> can't drive tools — this agent run stays on <strong>GPT-4.1</strong>. Nothing breaks.
+              <strong>{modelName(guard)}</strong> is a specialist in this integration — Agent mode will use a tool-capable premium orchestrator while keeping specialist capabilities available.
             </span>
             <button className="guard-btn" onClick={onGuardChat}>use it in Chat →</button>
             <button className="guard-btn" onClick={onGuardDismiss}>ok</button>
@@ -616,7 +622,7 @@ function Composer({ conv, agentMode, model, onOpenModel, onSend, onStop, busy, d
               {m.name || model}
               <Ic.down />
             </button>
-            {agentMode && !imgMode && <span className="tools-pill">15 tools ready</span>}
+            {agentMode && !imgMode && <span className="tools-pill">tools ready</span>}
             <span className="spacer" />
             <button className={'tool-btn' + (recording ? ' rec' : '')} title="Voice input" onClick={toggleRec}><Ic.mic /></button>
             {busy
@@ -1191,7 +1197,10 @@ function App() {
     });
     RdiWS.on('model_fallback', d => {
       setFallback(d);
-      pushToast(`${modelName(d.requested)} can't drive tools — run continues on ${modelName(d.fallback)}`);
+      pushToast(`${modelName(d.requested)} is being used as a specialist; orchestration continues on ${modelName(d.fallback)}`);
+    });
+    RdiWS.on('auto_agent_started', d => {
+      pushToast(d.reason || 'Using tools automatically for this request');
     });
     RdiWS.on('permission', d => setPermission(d));
     RdiWS.on('permission_auto', d => pushToast(`auto-approved read-only: ${d.tool}`));
@@ -1199,7 +1208,13 @@ function App() {
 
     RdiWS.on('tool_result', () => {});
     RdiWS.on('activity', () => {});
-    RdiWS.on('activity_done', () => {});
+    RdiWS.on('activity_done', () => setBusy(false));
+    RdiWS.on('cancelled', d => {
+      if (streamRef.current || runRef.current) finalizeStream();
+      setBusy(false);
+      setPermission(null);
+      pushToast(d.message || 'Run stopped');
+    });
     RdiWS.on('workspace', d => { setWsFiles(d.files || []); if (d.workspace_mode) setWsMode(d.workspace_mode); });
     RdiWS.on('artifacts', d => setArtifacts(d.artifacts || []));
     RdiWS.on('workspace_settings_updated', d => {
@@ -1319,7 +1334,7 @@ function App() {
     } else {
       RdiWS.send({
         type: 'chat', message: text, model, conversation_id: convId,
-        agent_mode: agentMode && !imgMode, attachments: payloadAtts,
+        agent_mode: agentMode && !imgMode, auto_agent: true, attachments: payloadAtts,
       });
     }
     if (!RdiWS.isConnected()) pushToast('Offline — message queued, will send on reconnect');
@@ -1350,12 +1365,31 @@ function App() {
 
   const imageAction = (img, action) => {
     if (!action) { setImgModal(img); return; }
-    const base = img.name.replace(/\.[a-z]+$/i, '');
     if (action === 'edit') {
-      const change = prompt('Describe the change (regenerates this image in place):');
-      if (change) sendMessage(`Edit image ${img.name}: ${change}`, []);
+      const change = prompt('Describe the image edit:');
+      if (change) {
+        setBusy(true);
+        RdiWS.send({
+          type: 'edit_image',
+          conversation_id: convId,
+          source_name: img.name,
+          image_base64: img.content,
+          prompt: change,
+          model: 'gpt-image-1-global',
+          count: 1,
+        });
+      }
     } else if (action === 'vary') {
-      sendMessage(`Generate 4 variations of ${base}, same subject and palette, different composition`, []);
+      setBusy(true);
+      RdiWS.send({
+        type: 'edit_image',
+        conversation_id: convId,
+        source_name: img.name,
+        image_base64: img.content,
+        prompt: 'Create a faithful variation of this image: preserve the subject, intent and key visual identity while exploring a meaningfully different composition.',
+        model: 'gpt-image-1-global',
+        count: 4,
+      });
     }
     setImgModal(null);
   };
@@ -1372,10 +1406,10 @@ function App() {
       disabled={false}
       onOpenModel={() => setModelOpen(true)}
       onSend={sendMessage}
-      onStop={() => pushToast('Run continues server-side — reload-safe; deny the next permission to halt it')}
+      onStop={() => RdiWS.send({ type: 'stop', conversation_id: convId })}
       attachments={attachments} setAttachments={setAttachments} uploadFile={uploadFile}
       guard={guard}
-      onGuardDismiss={() => { setGuard(null); setModel('gpt-4.1-global'); }}
+      onGuardDismiss={() => setGuard(null)}
       onGuardChat={() => { setAgentMode(false); setGuard(null); }}
       permission={permission} onPermission={decidePermission}
       autoAllow={autoAllow} onAutoAllow={setAutoAllowBoth}

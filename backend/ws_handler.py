@@ -37,6 +37,7 @@ from .agents.chat_agent import build_messages, stream_response, trim_history
 from .agents.coding_agent import run_coding_agent
 from .agents.tools import _workspace_var, get_file_tree
 from .config import get_config
+from .model_capabilities import model_supports_tools, preferred_agent_orchestrator
 from .database import (
     add_message, auto_title, checkpoint_run, create_conversation, create_run,
     delete_conversation, finish_run, get_conversation, get_latest_run,
@@ -45,12 +46,13 @@ from .database import (
     set_user_workspace, update_conversation_meta,
 )
 from .providers.azure_audio import text_to_speech_b64, transcribe
-from .providers.azure_image import generate_image
+from .providers.azure_image import edit_image, generate_image
 from .providers.vertex import generate_vertex_image
 
 # Activity icons per tool
 _TOOL_ICONS: Dict[str, str] = {
     "read_file": "📄", "write_file": "✏️", "create_file": "📝",
+    "patch_file": "🩹", "inspect_image": "👁️", "delegate_code": "🧠",
     "delete_file": "🗑️", "list_files": "📁", "run_bash": "⚡",
     "run_python": "🐍", "search_files": "🔍", "create_pdf": "📑",
     "create_pptx": "📊", "create_docx": "📃", "create_excel": "📈",
@@ -58,22 +60,11 @@ _TOOL_ICONS: Dict[str, str] = {
 }
 
 # Tools that never mutate anything — eligible for auto-approval.
-READONLY_TOOLS = {"read_file", "list_files", "search_files", "web_search", "web_crawl"}
+READONLY_TOOLS = {"read_file", "list_files", "search_files", "web_search", "web_crawl", "inspect_image"}
 
 # Tools that produce files — their outputs get registered as artifacts.
-FILE_TOOLS = {"write_file", "create_file", "create_pdf", "create_pptx",
+FILE_TOOLS = {"write_file", "create_file", "patch_file", "create_pdf", "create_pptx",
               "create_docx", "create_excel", "generate_image"}
-
-# Models that cannot drive function-calling tools. Selecting one in Agent mode
-# triggers a visible fallback instead of a broken run.
-_TOOLLESS_MARKERS = ("codex", "image", "dall", "imagen")
-_AGENT_FALLBACK_MODEL = "gpt-4.1-global"
-
-
-def model_supports_tools(model: str) -> bool:
-    m = (model or "").lower()
-    return not any(marker in m for marker in _TOOLLESS_MARKERS)
-
 
 # ── Stream state: survives socket drops, owns seq numbering ──────────────────
 
@@ -97,6 +88,7 @@ class StreamState:
         self.perm_events: Dict[str, asyncio.Event] = {}
         self.perm_decisions: Dict[str, str] = {}
         self.auto_allow_readonly = False
+        self.task: Optional[asyncio.Task] = None
 
     async def emit(self, data: dict) -> None:
         self.seq += 1
@@ -192,7 +184,11 @@ class WSSession:
     async def handle(self, data: dict) -> None:
         t = data.get("type", "")
         if t == "chat":
-            asyncio.create_task(self._handle_chat(data))
+            task = asyncio.create_task(self._handle_chat(data))
+            # The task is attached to the conversation stream once the
+            # conversation id is resolved inside _handle_chat.
+        elif t == "stop":
+            await self._handle_stop(data)
         elif t == "permission":
             await self._handle_permission(data)
         elif t == "resume":
@@ -216,6 +212,8 @@ class WSSession:
             self.model = data.get("model", self.model)
         elif t == "generate_image":
             asyncio.create_task(self._handle_image(data))
+        elif t == "edit_image":
+            asyncio.create_task(self._handle_edit_image(data))
         elif t == "tts":
             asyncio.create_task(self._handle_tts(data))
         elif t == "transcribe":
@@ -279,6 +277,20 @@ class WSSession:
             except Exception:
                 st.session = None
                 return
+
+    async def _handle_stop(self, data: dict) -> None:
+        cid = data.get("conversation_id") or self.conversation_id
+        if not cid:
+            return
+        st = _STREAMS.get(_stream_key(self.user["id"], cid))
+        if not st:
+            return
+        task = st.task
+        st.running = False
+        if task and not task.done():
+            task.cancel()
+        await st.emit({"type": "cancelled", "message": "Run stopped by user."})
+        await st.emit({"type": "activity_done"})
 
     # ── New conversation ──────────────────────────────────────────────────────
 
@@ -431,6 +443,7 @@ class WSSession:
             await update_conversation_meta(cid, model=model)
 
         st = self._attach_stream(cid)
+        st.task = asyncio.current_task()
 
         norm_atts = _normalize_attachments(attachments)
         await add_message(cid, "user", user_msg, attachments=norm_atts or None)
@@ -440,7 +453,14 @@ class WSSession:
         self.history.append({"role": "user", "content": user_msg, "attachments": norm_atts})
         self.history = trim_history(self.history)
 
-        agent_mode = data.get("agent_mode", False)
+        agent_mode = bool(data.get("agent_mode", False))
+        auto_agent = bool(data.get("auto_agent", True))
+        if not agent_mode and auto_agent and _should_auto_agent(user_msg, norm_atts):
+            agent_mode = True
+            await st.emit({
+                "type": "auto_agent_started",
+                "reason": "This request requires tools or workspace actions, so it was promoted to an agent run.",
+            })
         if agent_mode:
             await self._run_coding_agent(user_msg, model, cid, st, attachments=norm_atts)
             return
@@ -526,19 +546,24 @@ class WSSession:
         await self._load_ws_settings()
         _tok = _workspace_var.set(self._conv_workspace(cid))
 
-        # Model fallback: tool-less model in Agent mode → tool-capable fallback.
+        # Use the selected model when the current integration exposes function
+        # calling. Otherwise choose a premium orchestrator and keep specialist
+        # models (for example Codex) available through delegate_code.
         requested_model = model
-        run_model = model
-        if not model_supports_tools(model):
-            run_model = _AGENT_FALLBACK_MODEL
+        run_model = preferred_agent_orchestrator(
+            requested_model,
+            gpt5_configured=bool(get_config().azure_gpt5),
+        )
+        if run_model != requested_model:
             await st.emit({
                 "type": "model_fallback",
                 "requested": requested_model,
                 "fallback": run_model,
-                "reason": "selected model has no function-calling; agent run continues on fallback",
+                "reason": "selected model is a specialist or lacks tool calling in this integration; using a tool-capable orchestrator",
             })
 
         st.running = True
+        st.task = asyncio.current_task()
         run_id = await create_run(cid, self.user["id"], requested_model,
                                   fallback_model=run_model if run_model != requested_model else None)
         st.run_id = run_id
@@ -704,6 +729,7 @@ class WSSession:
             })
 
         agent_failed = False
+        cancelled = False
         err_text = None
         try:
             await run_coding_agent(
@@ -714,6 +740,9 @@ class WSSession:
                 pre_tool_callback=_pre_tool_cb,
                 image_fn=_image_fn,
             )
+        except asyncio.CancelledError:
+            cancelled = True
+            err_text = "cancelled by user"
         except Exception as exc:
             agent_failed = True
             err_text = str(exc)
@@ -722,11 +751,21 @@ class WSSession:
             _workspace_var.reset(_tok)
 
         st.running = False
+        st.task = None
         latency = int((time.time() - t0) * 1000)
 
         input_chars = sum(len(str(m.get("content", ""))) for m in self.history[:-1])
         in_toks = max(1, input_chars // 4)
         out_toks = max(1, len(full_response) // 4)
+
+        if cancelled:
+            if full_response:
+                await add_message(cid, "assistant", full_response)
+                self.history.append({"role": "assistant", "content": full_response})
+            await finish_run(run_id, "cancelled", in_toks, out_toks, 0.0, error=err_text)
+            await st.emit({"type": "run_step", "run_id": run_id,
+                           "steps": _public_steps(steps), "final": "cancelled"})
+            return
 
         if agent_failed:
             if full_response:
@@ -768,20 +807,19 @@ class WSSession:
     # ── Image generation ──────────────────────────────────────────────────────
 
     async def _handle_image(self, data: dict) -> None:
-        prompt = data.get("prompt", "")
+        prompt = data.get("prompt", "").strip()
         model = data.get("model", "gpt-image-2-global")
         size = data.get("size", "1024x1024")
+        count = max(1, min(int(data.get("count", 1) or 1), 4))
         atts = _normalize_attachments(data.get("attachments", []))
         if not prompt:
             await self.send_error("Image prompt required")
             return
 
         gen_prompt = prompt
-        doc_context = _attachments_context(atts, limit=1500)
+        doc_context = _attachments_context(atts, limit=3000)
         if doc_context:
-            gen_prompt = (
-                f"{prompt}\n\nUse the following reference material as visual context:\n{doc_context}"
-            )
+            gen_prompt = f"{prompt}\n\nReference context:\n{doc_context}"
 
         cid = data.get("conversation_id") or self.conversation_id
         if not cid:
@@ -792,25 +830,36 @@ class WSSession:
         first_msg = len(await get_messages(cid)) == 0
 
         st = self._attach_stream(cid)
+        st.task = asyncio.current_task()
         st.running = True
-        await st.emit({"type": "activity", "action": "Generating image…", "icon": "🖼️"})
-        b64 = None
-        url = None
+        await st.emit({"type": "activity", "action": f"Generating {count} image{'s' if count > 1 else ''}…", "icon": "🖼️"})
+
+        results = []
         try:
-            if model == "gemini-2.5-flash-image":
-                result = await generate_vertex_image(gen_prompt, model)
-                b64 = result.get("b64")
-            else:
-                result = await generate_image(gen_prompt, model, size)
-                b64 = result.get("b64")
-                url = result.get("url")
-            await st.emit({
-                "type": "image_result",
-                "url": url,
-                "base64": b64,
-                "prompt": prompt,
-                "model": model,
-            })
+            for i in range(count):
+                if model == "gemini-2.5-flash-image":
+                    result = await generate_vertex_image(gen_prompt, model)
+                    b64 = result.get("b64")
+                    url = None
+                else:
+                    result = await generate_image(gen_prompt, model, size)
+                    b64 = result.get("b64")
+                    url = result.get("url")
+                if not b64 and url:
+                    b64 = await _download_image_b64(url)
+                results.append((b64, url))
+                await st.emit({
+                    "type": "image_result",
+                    "url": url,
+                    "base64": b64,
+                    "prompt": prompt,
+                    "model": model,
+                    "variation_index": i,
+                    "variation_count": count,
+                })
+        except asyncio.CancelledError:
+            st.running = False
+            raise
         except Exception as exc:
             st.running = False
             await st.emit({"type": "error", "message": f"Image generation error: {exc}"})
@@ -818,39 +867,116 @@ class WSSession:
             return
 
         st.running = False
+        st.task = None
         await st.emit({"type": "activity_done"})
 
         try:
             await add_message(cid, "user", prompt, attachments=atts or None)
             if first_msg:
                 await auto_title(cid, prompt)
-            if b64:
-                fname = f"generated_{int(time.time())}.png"
-                # Save into the conversation workspace + register artifact so
-                # later steps ("make a PPT with those images") can reuse it.
-                try:
-                    await self._load_ws_settings()
-                    ws_dir = self._conv_workspace(cid)
-                    img_dir = ws_dir / "images"
-                    img_dir.mkdir(parents=True, exist_ok=True)
-                    (img_dir / fname).write_bytes(base64.b64decode(b64))
-                    await register_artifact(cid, fname, f"images/{fname}", kind="image",
-                                            size_bytes=(img_dir / fname).stat().st_size,
-                                            meta={"prompt": prompt, "model": model})
-                except Exception:
-                    pass
-                await add_message(
-                    cid, "assistant", f"[Generated image: {prompt}]",
-                    attachments=[{"name": fname, "type": "image/png", "content": b64}],
-                )
-            elif url:
-                await add_message(cid, "assistant", f"[Generated image: {prompt}]\n{url}")
+            for idx, (b64, url) in enumerate(results):
+                if b64:
+                    fname = f"generated_{int(time.time())}_{idx + 1}.png"
+                    try:
+                        await self._load_ws_settings()
+                        ws_dir = self._conv_workspace(cid)
+                        img_dir = ws_dir / "images"
+                        img_dir.mkdir(parents=True, exist_ok=True)
+                        (img_dir / fname).write_bytes(base64.b64decode(b64))
+                        await register_artifact(
+                            cid, fname, f"images/{fname}", kind="image",
+                            size_bytes=(img_dir / fname).stat().st_size,
+                            meta={"prompt": prompt, "model": model},
+                        )
+                    except Exception:
+                        pass
+                    await add_message(
+                        cid, "assistant", f"[Generated image: {prompt}]",
+                        attachments=[{"name": fname, "type": "image/png", "content": b64}],
+                    )
+                elif url:
+                    await add_message(cid, "assistant", f"[Generated image: {prompt}]\n{url}")
             await record_usage(
                 user_id=self.user["id"], conv_id=cid, model=model,
                 input_tokens=max(1, len(gen_prompt) // 4), output_tokens=0,
             )
         except Exception:
             pass
+
+    async def _handle_edit_image(self, data: dict) -> None:
+        prompt = data.get("prompt", "").strip()
+        image_b64 = data.get("image_base64", "")
+        mask_b64 = data.get("mask_base64")
+        size = data.get("size", "1024x1024")
+        model = data.get("model", "gpt-image-1-global")
+        source_name = data.get("source_name", "image.png")
+        count = max(1, min(int(data.get("count", 1) or 1), 4))
+        cid = data.get("conversation_id") or self.conversation_id
+
+        if not prompt or not image_b64:
+            await self.send_error("Image edit requires prompt and source image")
+            return
+        if not cid:
+            conv = await create_conversation(self.user["id"], model)
+            cid = conv["id"]
+            self.conversation_id = cid
+            await self.send({"type": "conversation_created", "id": cid, "conversation": conv})
+
+        st = self._attach_stream(cid)
+        st.task = asyncio.current_task()
+        st.running = True
+        await add_message(cid, "user", f"Edit {source_name}: {prompt}")
+        await st.emit({"type": "activity", "action": "Editing image…", "icon": "🖼️"})
+        try:
+            raw = image_b64.split(",", 1)[1] if image_b64.startswith("data:") else image_b64
+            mask_raw = None
+            if mask_b64:
+                mask_raw = mask_b64.split(",", 1)[1] if mask_b64.startswith("data:") else mask_b64
+            for idx in range(count):
+                result = await edit_image(
+                    base64.b64decode(raw),
+                    base64.b64decode(mask_raw) if mask_raw else None,
+                    prompt,
+                    model=model,
+                    size=size,
+                )
+                b64 = result.get("b64")
+                url = result.get("url")
+                if not b64 and url:
+                    b64 = await _download_image_b64(url)
+                await st.emit({
+                    "type": "image_result",
+                    "url": url,
+                    "base64": b64,
+                    "prompt": f"Edited {source_name}: {prompt}",
+                    "model": model,
+                    "edited_from": source_name,
+                    "variation_index": idx,
+                    "variation_count": count,
+                })
+                if b64:
+                    await self._load_ws_settings()
+                    fname = f"edited_{int(time.time())}_{idx + 1}.png"
+                    img_dir = self._conv_workspace(cid) / "images"
+                    img_dir.mkdir(parents=True, exist_ok=True)
+                    (img_dir / fname).write_bytes(base64.b64decode(b64))
+                    await register_artifact(
+                        cid, fname, f"images/{fname}", kind="image",
+                        size_bytes=(img_dir / fname).stat().st_size,
+                        meta={"edit_prompt": prompt, "source": source_name, "model": model},
+                    )
+                    await add_message(
+                        cid, "assistant", f"[Edited image: {source_name}]",
+                        attachments=[{"name": fname, "type": "image/png", "content": b64}],
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await st.emit({"type": "error", "message": f"Image edit error: {exc}"})
+        finally:
+            st.running = False
+            st.task = None
+            await st.emit({"type": "activity_done"})
 
     # ── Text-to-speech ────────────────────────────────────────────────────────
 
@@ -881,6 +1007,49 @@ class WSSession:
             await self.send({"type": "transcription", "text": text})
         except Exception as exc:
             await self.send_error(f"Transcription error: {exc}")
+
+
+async def _download_image_b64(url: str) -> str:
+    """Normalize temporary provider URLs into durable base64 results."""
+    if not url:
+        return ""
+    loop = asyncio.get_running_loop()
+
+    def _download() -> bytes:
+        import requests
+        resp = requests.get(url, timeout=60)
+        resp.raise_for_status()
+        return resp.content
+
+    raw = await loop.run_in_executor(None, _download)
+    return base64.b64encode(raw).decode()
+
+
+def _should_auto_agent(message: str, attachments: List[Dict]) -> bool:
+    """Conservative tool-intent detector for ChatGPT-like automatic tool use.
+
+    We intentionally avoid sending every normal question through the agent. The
+    promotion only happens for explicit action verbs or file/workspace tasks.
+    """
+    text = (message or "").lower()
+    phrases = (
+        "create a file", "create file", "edit the file", "modify the file",
+        "update the file", "fix the file", "make changes", "implement this",
+        "fix this code", "fix the codebase", "update this repo", "update the repo",
+        "run the code", "run tests", "execute the code", "debug this",
+        "create a powerpoint", "build a powerpoint", "create ppt", "create a pdf",
+        "create pdf", "create docx", "create a word", "create excel", "create xlsx",
+        "search the web", "browse the web", "look up the latest", "research the latest",
+        "use the workspace", "in the workspace", "inspect the attached",
+        "analyze the attached", "edit this image", "modify this image",
+    )
+    if any(p in text for p in phrases):
+        return True
+    if attachments:
+        action_words = ("analyze", "edit", "fix", "modify", "update", "implement", "run", "build")
+        if any(w in text for w in action_words):
+            return True
+    return False
 
 
 # ── Attachment normalization ──────────────────────────────────────────────────
@@ -944,6 +1113,9 @@ def _tool_label(tool: str, args: dict) -> str:
     if tool == "run_bash":     return f"Running: {args.get('command', '')[:60]}"
     if tool == "run_python":   return "Running Python code"
     if tool == "search_files": return f"Searching for '{args.get('pattern', '')}'"
+    if tool == "patch_file":   return f"Patching {args.get('path', '')}"
+    if tool == "inspect_image": return f"Inspecting {args.get('path', '')}"
+    if tool == "delegate_code": return "Consulting code specialist"
     if tool == "create_pdf":   return f"Creating PDF: {args.get('filename', '')}"
     if tool == "create_pptx":  return f"Creating PowerPoint: {args.get('filename', '')}"
     if tool == "create_docx":  return f"Creating Word doc: {args.get('filename', '')}"

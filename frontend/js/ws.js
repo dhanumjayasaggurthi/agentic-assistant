@@ -22,14 +22,23 @@ const RdiWS = (() => {
   let _activeConv = null;         // conversation id whose stream we track
   let _intentionalClose = false;
   let _pingTimer = null;
+  let _awaitingResume = false;
 
   function on(type, fn) { _handlers[type] = fn; }
 
   function dispatch(data) {
-    // Track stream position for resume
+    // Track stream position for resume.
     if (typeof data.seq === 'number' && data.seq > _lastSeq) _lastSeq = data.seq;
     const fn = _handlers[data.type] || _handlers['*'];
     if (fn) fn(data);
+
+    // Resume/replay must finish before queued user actions are sent. Previously
+    // the queue flushed immediately after the resume request, allowing new
+    // messages to interleave with replayed stream events.
+    if (data.type === 'resume_ok' && _awaitingResume) {
+      _awaitingResume = false;
+      _flushQueue();
+    }
   }
 
   function setActiveConversation(cid, startSeq) {
@@ -74,9 +83,12 @@ const RdiWS = (() => {
       // Resume the active stream BEFORE flushing user sends, so replayed
       // events arrive in order ahead of new activity.
       if (wasReconnect && _activeConv) {
+        _awaitingResume = true;
         _rawSend({ type: 'resume', conversation_id: _activeConv, last_seq: _lastSeq });
+      } else {
+        _awaitingResume = false;
+        _flushQueue();
       }
-      _flushQueue();
       // Heartbeat keeps corporate proxies from idling the socket out.
       if (_pingTimer) clearInterval(_pingTimer);
       _pingTimer = setInterval(() => _rawSend({ type: 'ping', ts: Date.now() }), 25000);
@@ -134,6 +146,7 @@ const RdiWS = (() => {
     _connected = false;
     _queue = [];
     _attempt = 0;
+    _awaitingResume = false;
   }
 
   function isConnected() { return _connected; }

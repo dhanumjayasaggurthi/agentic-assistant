@@ -39,7 +39,7 @@ def _client() -> AsyncAzureOpenAI:
 async def stream_chat(
     messages: List[dict],
     model: str,
-    max_tokens: int = 4096,
+    max_tokens: int = 8192,
     temperature: Optional[float] = None,
 ) -> AsyncGenerator[str, None]:
     if model in _RESPONSES_MODELS:
@@ -69,7 +69,7 @@ async def complete_with_tools(
     messages: List[dict],
     model: str,
     tools: List[dict],
-    max_tokens: int = 4096,
+    max_tokens: int = 8192,
 ) -> dict:
     """Non-streaming call with tool use support."""
     c = _client()
@@ -91,7 +91,7 @@ async def complete_with_tools(
     }
 
 
-async def responses_api(model: str, prompt: str, max_output_tokens: int = 4096) -> str:
+async def responses_api(model: str, prompt: str, max_output_tokens: int = 8192) -> str:
     """Responses API for o3-pro-global — POST /openai/v1/responses."""
     cfg = get_config().azure_chat
     if not cfg:

@@ -59,16 +59,31 @@ def _user_content(text: str, attachments: Optional[List[Dict]]):
     return parts
 
 
-def attachments_to_text(attachments: Optional[List[Dict]]) -> str:
-    """Flatten attachments to a plain-text block (for text-only / tool-calling models)."""
+def attachments_to_text(
+    attachments: Optional[List[Dict]],
+    per_file_chars: int = 20_000,
+    total_chars: int = 60_000,
+) -> str:
+    """Flatten attachments for text-only/tool models without exploding context."""
     parts = []
+    used = 0
     for att in attachments or []:
         name = att.get("name", "file")
         if _is_image_attachment(att):
-            parts.append(f"[Attached image: {name}]")
+            piece = f"[Attached image available in workspace: {name}]"
         else:
-            content = att.get("content", "")
-            parts.append(f"--- Attached file: {name} ---\n{content}\n---")
+            content = str(att.get("content", "") or "")
+            if len(content) > per_file_chars:
+                content = content[:per_file_chars] + "\n...[attachment truncated]"
+            piece = f"--- Attached file: {name} ---\n{content}\n---"
+        remaining = total_chars - used
+        if remaining <= 0:
+            parts.append("[Additional attachments omitted from model context]")
+            break
+        if len(piece) > remaining:
+            piece = piece[:remaining] + "\n...[attachment context limit reached]"
+        parts.append(piece)
+        used += len(piece)
     return "\n\n".join(parts)
 
 
@@ -87,10 +102,16 @@ def build_messages(
         if role not in ("user", "assistant"):
             continue
         content = m.get("content", "")
-        # Re-attach prior-turn files so follow-up questions keep their context.
+        # Keep prior attachment awareness without resending historical image
+        # base64 or full documents on every turn. The original behavior caused
+        # context to balloon dramatically after a few multimodal turns.
         hist_atts = m.get("attachments") if role == "user" else None
         if hist_atts:
-            messages.append({"role": role, "content": _user_content(content, hist_atts)})
+            prior = attachments_to_text(hist_atts, per_file_chars=12_000, total_chars=30_000)
+            joined = (content or "")
+            if prior:
+                joined = (joined + "\n\n" + prior).strip()
+            messages.append({"role": role, "content": joined})
         else:
             messages.append({"role": role, "content": content})
 
@@ -131,7 +152,7 @@ async def stream_response(
         yield f"Unknown provider for model: {model}"
 
 
-def trim_history(history: List[Dict], max_chars: int = 400_000) -> List[Dict]:
+def trim_history(history: List[Dict], max_chars: int = 180_000) -> List[Dict]:
     """Sliding window: drop the OLDEST messages first, keeping newest within budget.
 
     history holds only user/assistant turns (no system message), so we pop from
