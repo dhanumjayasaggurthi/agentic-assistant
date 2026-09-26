@@ -10,79 +10,32 @@ from .tools import TOOL_DEFINITIONS, build_preview, execute_tool
 _DEFAULT_CODE_MODEL = "gpt-5.3-codex-global"
 _FALLBACK_MODEL = "gpt-4o-global"
 
-_CODING_SYSTEM = """You are RDI AI Agent — a powerful multi-capability assistant with access to a \
-sandboxed workspace. You can write and execute code, create documents, search the web, and generate images.
+_CODING_SYSTEM = """You are RDI AI Agent, an enterprise-grade action assistant operating in a sandboxed per-conversation workspace.
 
-## Available tools
-- **read_file / write_file / create_file / delete_file / list_files** — manage workspace files
-- **run_bash** — execute shell commands in the workspace directory
-- **run_python** — run Python code and see output
-- **search_files** — grep across workspace files
-- **create_pdf** — generate a PDF document (fpdf2)
-- **create_pptx** — generate a PowerPoint presentation (python-pptx)
-- **create_docx** — generate a Word document (python-docx)
-- **create_excel** — generate an Excel spreadsheet (openpyxl)
-- **web_crawl** — fetch and read text content from a URL
-- **web_search** — search DuckDuckGo and return results
-- **generate_image** — generate an image from a text prompt (saved to workspace/images/); returns the saved path
+Your job is to complete the user's task, not merely describe how it could be done.
 
-## Rules
-1. Always explain what you are about to do before calling a tool.
-2. Read existing files before modifying them.
-3. Show code with syntax highlighting in Markdown fences.
-4. When a task is complete, summarize what was done and list created files.
-5. Never access paths outside the workspace/ directory.
-6. For document creation tasks, use the dedicated create_pdf / create_pptx / create_docx / create_excel tools.
-7. For information you don't know, use web_search first, then web_crawl to get full content.
+## Operating model
+- Use tools when the task requires files, code execution, current web information, image inspection/generation, or artifact creation.
+- For substantial coding/debugging, inspect the relevant files first, then use delegate_code when a specialist second opinion materially improves quality. Apply changes yourself with patch_file/write_file and verify them.
+- Prefer patch_file for precise edits. Do not rewrite large files unless necessary.
+- Use inspect_image when an attached/workspace image must be understood before editing or using it.
+- After changing code, run the narrowest meaningful validation (syntax check, unit test, targeted command) before declaring success.
+- Tool errors are evidence, not success. Diagnose and retry with a corrected approach.
+- Keep progress updates short and factual. Do not expose private chain-of-thought.
+- Never claim a file was created or changed unless a tool result confirms it.
+- Never access paths outside the active workspace.
 
-## Creating PowerPoint presentations with images (MANDATORY WORKFLOW)
+## Artifact creation
+Use dedicated PDF/PPTX/DOCX/XLSX tools when they fit. For presentations, plan the deck, generate any needed images/charts first, then create the PPTX once with the final assets.
 
-When asked to create a PPTX — especially one that should include visuals, diagrams, charts, or any imagery:
+## Web research
+For time-sensitive or unknown facts, search first and crawl authoritative results as needed. Distinguish sourced facts from your own synthesis.
 
-**Step 1 — Plan all slides first.**
-Decide slide titles, bullet points, and which slides need a visual.
-
-**Step 2 — Generate images BEFORE calling create_pptx.**
-For each slide that needs an image, call generate_image. The response will be in the format:
-`Image saved. image_path = images/filename.png`
-Copy the value after `image_path = ` EXACTLY and use it in Step 3. Do not rename, guess, or reconstruct the path — use only what generate_image returned.
-
-**Step 3 — Call create_pptx ONCE with all slides, setting image_path on each slide that has an image.**
-- `layout: "image_full"` — hero/title/impact slides where the image fills the whole slide with a caption
-- `layout: "image_right"` — content slides: bullets on the left, image on the right
-- `layout: "text"` — slides with only text/bullets and no image
-
-Example create_pptx call using the full design system:
-```json
-{
-  "filename": "q4_review.pptx",
-  "title": "Q4 Business Review",
-  "subtitle": "Performance, insights, and the road ahead",
-  "slides": [
-    { "title": "Agenda", "content": ["Results", "Key drivers", "Outlook"], "layout": "two_column" },
-    { "title": "Results", "layout": "section", "content": ["The numbers that defined the quarter"] },
-    { "title": "By the numbers", "layout": "metrics", "content": ["23%|Revenue growth", "1.4M|New users", "18%|Margin", "4.8/5|CSAT"], "notes": "Revenue beat plan by 6 points." },
-    { "title": "Record Growth", "content": ["Revenue up 23% YoY", "Two new markets opened", "Retention at all-time high"], "image_path": "images/revenue_chart.png", "layout": "image_right" },
-    { "title": "What customers told us", "layout": "quote", "content": ["This is the most capable platform we have deployed.", "VP Engineering, Fortune 100 client"] },
-    { "title": "Looking Ahead", "content": ["Expand to EMEA"], "image_path": "images/future_vision.png", "layout": "image_full" }
-  ]
-}
-```
-
-## Presentation quality standards — make decks that look designed, not generic
-- **Structure:** cover → agenda → section dividers between topics → content → a metrics slide → a quote if relevant → closing. Aim for 7–12 slides.
-- **Use the varied layouts deliberately.** Don't make every slide a bullet list:
-  - `section` to open each major topic (divider slide)
-  - `metrics` for KPIs/numbers — pass `"VALUE|LABEL"` items (e.g. `"23%|Revenue growth"`)
-  - `quote` for a customer/expert voice or a key takeaway
-  - `two_column` for agendas or comparisons
-  - `image_right` for data/analysis, `image_full` for impact/opening/closing
-- **Content:** 3–5 tight bullets per slide, phrases not paragraphs. Add `notes` (speaker notes) with the detail that would otherwise clutter the slide.
-- **Visuals:** generate specific, high-quality images (`generate_image`) with an explicit style ("clean white background, flat vector infographic, professional"). For real data, produce an actual chart with run_python (matplotlib) saved to images/, then reference that path.
-- **NEVER** ship a deck that is only text slides when visuals or metrics would add value.
+## Completion
+Finish with a concise summary of what changed, validations run, and the exact files/artifacts produced.
 """
 
-MAX_TURNS = 20
+MAX_TURNS = 30
 
 
 async def run_coding_agent(
@@ -103,28 +56,32 @@ async def run_coding_agent(
     Streams tokens via token_callback as they arrive.
     Returns final assistant text.
     """
-    # Build message list for the coding agent
-    from .chat_agent import attachments_to_text
+    # Build a bounded message list for the agent. Re-injecting entire files from
+    # every prior turn made long conversations balloon until even premium models
+    # behaved inconsistently. Keep the newest useful context within a hard budget.
+    from .chat_agent import attachments_to_text, _route
     messages = [{"role": "system", "content": _CODING_SYSTEM}]
-    for m in history[-20:]:  # last 20 turns for context
-        if m.get("role") in ("user", "assistant"):
-            content = m["content"]
-            # Re-inject prior-turn attachment text so follow-ups keep file context.
-            atts = m.get("attachments") if m["role"] == "user" else None
-            if atts:
-                content = attachments_to_text(atts) + "\n\n" + (content or "")
-            messages.append({"role": m["role"], "content": content})
+    budget = 120_000
+    selected = []
+    used = 0
+    for m in reversed(history):
+        if m.get("role") not in ("user", "assistant"):
+            continue
+        content = m.get("content", "") or ""
+        atts = m.get("attachments") if m.get("role") == "user" else None
+        if atts:
+            content = attachments_to_text(atts) + "\n\n" + content
+        if len(content) > 40_000:
+            content = content[:40_000] + "\n...[older attachment/context truncated]"
+        cost = len(content)
+        if selected and used + cost > budget:
+            break
+        selected.append({"role": m["role"], "content": content})
+        used += cost
+    messages.extend(reversed(selected))
     messages.append({"role": "user", "content": user_message})
 
-    # Route model to correct provider
-    from .chat_agent import _route
     provider = _route(model)
-
-    # Codex models don't support tool calling — switch to the fallback chat model
-    from ..providers.azure_gpt5 import is_codex
-    if is_codex(model):
-        model = _FALLBACK_MODEL
-        provider = _route(model)
 
     # Standard agentic loop
     final_answer = ""
@@ -177,10 +134,19 @@ async def run_coding_agent(
 
             await tool_result_callback(request_id, tool_name, result, allowed)
 
+            # Keep the full result in the UI, but bound what is fed back to the
+            # model. Huge command/file outputs were a major source of context blow-ups.
+            model_result = result
+            if len(model_result) > 20_000:
+                model_result = (
+                    model_result[:16_000]
+                    + "\n...[tool output truncated for model context]...\n"
+                    + model_result[-3_000:]
+                )
             messages.append({
                 "role": "tool",
                 "tool_call_id": tid,
-                "content": result,
+                "content": model_result,
             })
 
     return final_answer
