@@ -1409,7 +1409,7 @@ function App() {
       onStop={() => RdiWS.send({ type: 'stop', conversation_id: convId })}
       attachments={attachments} setAttachments={setAttachments} uploadFile={uploadFile}
       guard={guard}
-      onGuardDismiss={() => { setGuard(null); setModel('gpt-4.1-global'); }}
+      onGuardDismiss={() => setGuard(null)}
       onGuardChat={() => { setAgentMode(false); setGuard(null); }}
       permission={permission} onPermission={decidePermission}
       autoAllow={autoAllow} onAutoAllow={setAutoAllowBoth}
