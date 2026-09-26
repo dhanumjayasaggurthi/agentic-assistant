@@ -560,10 +560,18 @@ async def _inspect_image(args: Dict) -> str:
             {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
         ],
     }]
-    from ..providers.azure_chat import stream_chat
+    cfg = get_config()
     chunks = []
-    async for token in stream_chat(messages, "gpt-4.1-global", max_tokens=3000):
-        chunks.append(token)
+    if cfg.azure_chat:
+        from ..providers.azure_chat import stream_chat
+        async for token in stream_chat(messages, "gpt-4.1-global", max_tokens=4000):
+            chunks.append(token)
+    elif cfg.azure_gpt5:
+        from ..providers.azure_gpt5 import stream_gpt5
+        async for token in stream_gpt5(messages, "gpt-5-global", max_tokens=4000):
+            chunks.append(token)
+    else:
+        return "Error: no vision-capable Azure chat/GPT-5 gateway is configured"
     return "".join(chunks)
 
 
