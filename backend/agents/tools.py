@@ -3,8 +3,6 @@ import asyncio
 import contextvars
 import difflib
 import json
-import subprocess
-import sys
 import urllib.parse
 import urllib.request
 from html.parser import HTMLParser
@@ -12,6 +10,7 @@ from pathlib import Path
 from typing import Dict, List
 
 from ..config import get_config
+from ..execution import run_python as execute_python_code, run_shell
 
 # ── Per-request workspace contextvar (set per user in ws_handler) ─────────────
 
@@ -617,43 +616,31 @@ async def _list_files(args: Dict) -> str:
 
 
 async def _run_bash(args: Dict) -> str:
-    cmd = args["command"]
-    timeout = min(int(args.get("timeout", 30)), 60)
-    workspace = _active_workspace()
-    loop = asyncio.get_event_loop()
-
-    def _run():
-        result = subprocess.run(
-            cmd, shell=True, cwd=str(workspace),
-            capture_output=True, text=True, timeout=timeout,
-        )
-        out = result.stdout + result.stderr
-        return out[:4000] + ("…[truncated]" if len(out) > 4000 else "")
-
-    try:
-        return await loop.run_in_executor(None, _run)
-    except subprocess.TimeoutExpired:
-        return f"Command timed out after {timeout}s"
+    result = await run_shell(
+        _active_workspace(),
+        args["command"],
+        timeout=int(args.get("timeout", 30)),
+    )
+    out = result.combined
+    if result.exit_code != 0:
+        out += f"\n[exit_code={result.exit_code}; execution_mode={result.mode}]"
+    else:
+        out += f"\n[execution_mode={result.mode}]"
+    return out[:8000] + ("…[truncated]" if len(out) > 8000 else "")
 
 
 async def _run_python(args: Dict) -> str:
-    code = args["code"]
-    timeout = min(int(args.get("timeout", 30)), 60)
-    workspace = str(_active_workspace())
-    loop = asyncio.get_event_loop()
-
-    def _run():
-        result = subprocess.run(
-            [sys.executable, "-c", code],
-            cwd=workspace, capture_output=True, text=True, timeout=timeout,
-        )
-        out = result.stdout + result.stderr
-        return out[:4000] + ("…[truncated]" if len(out) > 4000 else "")
-
-    try:
-        return await loop.run_in_executor(None, _run)
-    except subprocess.TimeoutExpired:
-        return f"Python execution timed out after {timeout}s"
+    result = await execute_python_code(
+        _active_workspace(),
+        args["code"],
+        timeout=int(args.get("timeout", 30)),
+    )
+    out = result.combined
+    if result.exit_code != 0:
+        out += f"\n[exit_code={result.exit_code}; execution_mode={result.mode}]"
+    else:
+        out += f"\n[execution_mode={result.mode}]"
+    return out[:8000] + ("…[truncated]" if len(out) > 8000 else "")
 
 
 async def _search_files(args: Dict) -> str:
