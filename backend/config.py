@@ -109,6 +109,7 @@ class AppConfig:
     jwt_secret: str
     workspace_dir: Path
     db_path: Path
+    max_upload_mb: int = 100
     admin_username: str = "admin"
     admin_password: str = ""  # read from config.ini [app] admin_password — no default in code
 
@@ -268,6 +269,7 @@ def load_config() -> AppConfig:
         execution=execution,
         workspace_dir=workspace_dir,
         db_path=db_path,
+        max_upload_mb=int(os.environ.get("RDI_MAX_UPLOAD_MB") or _get(cfg, "app", "max_upload_mb", "100")),
         admin_username=_get(cfg, "app", "admin_username", "admin"),
         admin_password=_get(cfg, "app", "admin_password", ""),
     )
