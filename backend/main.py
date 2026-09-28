@@ -210,37 +210,70 @@ async def upload_file(
     conversation_id: str = Form(None),
     user=Depends(get_current_user),
 ):
-    """Persist the original upload and return a lightweight attachment handle.
-
-    The browser no longer receives extracted document text or image base64 just
-    to send it back over the WebSocket. Model context is hydrated server-side.
-    """
+    """Persist the original upload and return a lightweight attachment handle."""
     content_type = file.content_type or "application/octet-stream"
-    raw = await file.read()
     filename = Path(file.filename or "upload").name
     aid = str(uuid.uuid4())
 
-    # Keep the original bytes in the user's workspace-owned upload area.
     rel_path = Path("_uploads") / aid / filename
     disk_path = _user_ws_base(user) / rel_path
     disk_path.parent.mkdir(parents=True, exist_ok=True)
-    disk_path.write_bytes(raw)
 
-    # Extract bounded textual context once; images keep their bytes on disk.
+    max_bytes = max(1, get_config().max_upload_mb) * 1024 * 1024
+    size_bytes = 0
+    try:
+        with disk_path.open("wb") as out:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                size_bytes += len(chunk)
+                if size_bytes > max_bytes:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"Upload exceeds {get_config().max_upload_mb} MB limit",
+                    )
+                out.write(chunk)
+    except Exception:
+        try:
+            disk_path.unlink(missing_ok=True)
+            disk_path.parent.rmdir()
+        except Exception:
+            pass
+        raise
+
+    # Extract bounded textual context once; original bytes remain on disk.
     content = ""
     file_type = "image" if content_type.startswith("image/") else "text"
     if content_type == "application/pdf":
         try:
             import PyPDF2
-            reader = PyPDF2.PdfReader(io.BytesIO(raw))
-            content = "\n".join((page.extract_text() or "") for page in reader.pages)
+            reader = PyPDF2.PdfReader(str(disk_path))
+            parts = []
+            total = 0
+            for page in reader.pages:
+                text_part = page.extract_text() or ""
+                remaining = 1_000_000 - total
+                if remaining <= 0:
+                    break
+                parts.append(text_part[:remaining])
+                total += min(len(text_part), remaining)
+            content = "\n".join(parts)
         except Exception:
             content = ""
     elif "word" in content_type or filename.lower().endswith(".docx"):
         try:
             from docx import Document
-            doc = Document(io.BytesIO(raw))
-            content = "\n".join(p.text for p in doc.paragraphs)
+            doc = Document(str(disk_path))
+            parts, total = [], 0
+            for p in doc.paragraphs:
+                text_part = p.text
+                remaining = 1_000_000 - total
+                if remaining <= 0:
+                    break
+                parts.append(text_part[:remaining])
+                total += min(len(text_part), remaining)
+            content = "\n".join(parts)
         except Exception:
             content = ""
     elif (
@@ -250,7 +283,7 @@ async def upload_file(
         import zipfile
         parts, total = [], 0
         try:
-            with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+            with zipfile.ZipFile(str(disk_path)) as zf:
                 names = [
                     n for n in zf.namelist()
                     if not n.endswith("/") and not n.startswith("__MACOSX")
@@ -270,20 +303,24 @@ async def upload_file(
                                 text_part = data.decode("latin-1")
                             except Exception:
                                 continue
+                        remaining = 1_000_000 - total
+                        if remaining <= 0:
+                            break
+                        text_part = text_part[:remaining]
                         parts.append(f"=== {name} ===\n{text_part}")
                         total += len(text_part)
-                        if total >= 1_000_000:
-                            parts.append("[ZIP extraction stopped at 1 MB text budget]")
-                            break
                     except Exception as ex:
                         parts.append(f"=== {name} [error: {ex}] ===")
         except zipfile.BadZipFile:
             parts = ["[Invalid ZIP file]"]
         content = "\n\n".join(parts)
     elif not content_type.startswith("image/"):
-        content = raw.decode("utf-8", errors="replace")
+        try:
+            with disk_path.open("rb") as src:
+                content = src.read(1_000_000).decode("utf-8", errors="replace")
+        except Exception:
+            content = ""
 
-    # Bound persisted extracted text; the raw file remains available for tools.
     if len(content) > 1_000_000:
         content = content[:1_000_000] + "\n...[extracted text truncated]"
 
@@ -295,7 +332,7 @@ async def upload_file(
         content,
         user_id=user["id"],
         storage_path=str(rel_path).replace("\\", "/"),
-        size_bytes=len(raw),
+        size_bytes=size_bytes,
         attachment_id=aid,
     )
 
@@ -306,7 +343,7 @@ async def upload_file(
         "name": filename,
         "type": file_type,
         "content_type": content_type,
-        "size": len(raw),
+        "size": size_bytes,
     }
 
 
