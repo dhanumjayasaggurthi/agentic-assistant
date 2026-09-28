@@ -49,6 +49,7 @@ from .database import (
 from .providers.azure_audio import text_to_speech_b64, transcribe
 from .providers.azure_image import edit_image, generate_image
 from .providers.vertex import generate_vertex_image
+from .telemetry import emit as telemetry_emit
 
 # Activity icons per tool
 _TOOL_ICONS: Dict[str, str] = {
@@ -617,6 +618,14 @@ class WSSession:
             requested_model,
             gpt5_configured=bool(get_config().azure_gpt5),
         )
+        telemetry_emit(
+            "agent_model_route",
+            conversation_id=cid,
+            user_id=self.user["id"],
+            requested_model=requested_model,
+            orchestrator_model=run_model,
+            delegated=(run_model != requested_model),
+        )
         if run_model != requested_model:
             await st.emit({
                 "type": "model_fallback",
@@ -762,6 +771,15 @@ class WSSession:
                     s["duration_ms"] = int((time.time() - s.get("t0", time.time())) * 1000)
                     s["result_preview"] = (result or "")[:200]
                     break
+            telemetry_emit(
+                "agent_tool_result",
+                conversation_id=cid,
+                run_id=run_id,
+                tool=tool,
+                allowed=allowed,
+                success=bool(allowed and not str(result).startswith("Error:")),
+                duration_ms=s.get("duration_ms") if 's' in locals() else None,
+            )
             await st.emit({"type": "activity", "action": f"{status}: {tool}", "icon": icon})
             await st.emit({
                 "type": "tool_result",
@@ -863,6 +881,15 @@ class WSSession:
         await add_message(cid, "assistant", full_response)
         self.history.append({"role": "assistant", "content": full_response})
 
+        telemetry_emit(
+            "agent_run_completed",
+            conversation_id=cid,
+            run_id=run_id,
+            model=run_model,
+            latency_ms=latency,
+            steps=len(steps),
+            output_chars=len(full_response),
+        )
         await record_usage(user_id=self.user["id"], conv_id=cid, model=run_model,
                            input_tokens=in_toks, output_tokens=out_toks)
         await finish_run(run_id, "done", in_toks, out_toks, 0.0)
