@@ -764,12 +764,14 @@ class WSSession:
         async def _result_cb(rid: str, tool: str, result: str, allowed: bool):
             icon = _TOOL_ICONS.get(tool, "🔧")
             status = "Done" if allowed else "Skipped"
+            duration_ms = None
             # Close the latest running step for this tool
-            for s in reversed(steps):
-                if s["tool"] == tool and s.get("status") in ("running", "waiting_permission"):
-                    s["status"] = "done" if allowed else "denied"
-                    s["duration_ms"] = int((time.time() - s.get("t0", time.time())) * 1000)
-                    s["result_preview"] = (result or "")[:200]
+            for step in reversed(steps):
+                if step["tool"] == tool and step.get("status") in ("running", "waiting_permission"):
+                    step["status"] = "done" if allowed else "denied"
+                    duration_ms = int((time.time() - step.get("t0", time.time())) * 1000)
+                    step["duration_ms"] = duration_ms
+                    step["result_preview"] = (result or "")[:200]
                     break
             telemetry_emit(
                 "agent_tool_result",
@@ -778,7 +780,7 @@ class WSSession:
                 tool=tool,
                 allowed=allowed,
                 success=bool(allowed and not str(result).startswith("Error:")),
-                duration_ms=s.get("duration_ms") if 's' in locals() else None,
+                duration_ms=duration_ms,
             )
             await st.emit({"type": "activity", "action": f"{status}: {tool}", "icon": icon})
             await st.emit({
