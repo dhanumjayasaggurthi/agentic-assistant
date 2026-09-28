@@ -6,6 +6,7 @@ Startup fails fast with a clear message when the database is not configured.
 import base64
 import io
 import sys
+import uuid
 from pathlib import Path
 
 # Windows UTF-8 fix
@@ -209,93 +210,102 @@ async def upload_file(
     conversation_id: str = Form(None),
     user=Depends(get_current_user),
 ):
+    """Persist the original upload and return a lightweight attachment handle.
+
+    The browser no longer receives extracted document text or image base64 just
+    to send it back over the WebSocket. Model context is hydrated server-side.
+    """
     content_type = file.content_type or "application/octet-stream"
     raw = await file.read()
-    filename = file.filename or "upload"
+    filename = Path(file.filename or "upload").name
+    aid = str(uuid.uuid4())
 
-    # Convert to text or base64 based on type
-    if content_type.startswith("image/"):
-        content = base64.b64encode(raw).decode()
-        file_type = "image"
-    elif content_type == "application/pdf":
+    # Keep the original bytes in the user's workspace-owned upload area.
+    rel_path = Path("_uploads") / aid / filename
+    disk_path = _user_ws_base(user) / rel_path
+    disk_path.parent.mkdir(parents=True, exist_ok=True)
+    disk_path.write_bytes(raw)
+
+    # Extract bounded textual context once; images keep their bytes on disk.
+    content = ""
+    file_type = "image" if content_type.startswith("image/") else "text"
+    if content_type == "application/pdf":
         try:
             import PyPDF2
             reader = PyPDF2.PdfReader(io.BytesIO(raw))
-            content = "\n".join(
-                page.extract_text() or "" for page in reader.pages
-            )
+            content = "\n".join((page.extract_text() or "") for page in reader.pages)
         except Exception:
-            content = raw.decode("utf-8", errors="replace")
-        file_type = "text"
-    elif "word" in content_type or filename.endswith(".docx"):
+            content = ""
+    elif "word" in content_type or filename.lower().endswith(".docx"):
         try:
             from docx import Document
             doc = Document(io.BytesIO(raw))
             content = "\n".join(p.text for p in doc.paragraphs)
         except Exception:
-            content = raw.decode("utf-8", errors="replace")
-        file_type = "text"
+            content = ""
     elif (
         content_type in ("application/zip", "application/x-zip-compressed", "application/x-zip")
         or filename.lower().endswith(".zip")
     ):
         import zipfile
-        parts = []
+        parts, total = [], 0
         try:
             with zipfile.ZipFile(io.BytesIO(raw)) as zf:
-                names = [n for n in zf.namelist()
-                         if not n.endswith("/") and not n.startswith("__MACOSX") and "/.DS_Store" not in n]
-                # Cap: max 50 files, max 200KB per file, max 1MB total extracted
-                total = 0
+                names = [
+                    n for n in zf.namelist()
+                    if not n.endswith("/") and not n.startswith("__MACOSX")
+                    and "/.DS_Store" not in n
+                ]
                 for name in names[:50]:
                     try:
-                        # Check the declared uncompressed size BEFORE reading, so a
-                        # zip-bomb entry isn't fully decompressed into memory.
-                        try:
-                            if zf.getinfo(name).file_size > 200_000:
-                                parts.append(f"=== {name} [truncated — file too large] ===")
-                                continue
-                        except KeyError:
-                            pass
-                        data = zf.read(name)
-                        if len(data) > 200_000:
-                            parts.append(f"=== {name} [truncated — file too large] ===")
+                        info = zf.getinfo(name)
+                        if info.file_size > 200_000:
+                            parts.append(f"=== {name} [skipped: file too large] ===")
                             continue
-                        # Attempt UTF-8 decode; skip binary files silently
+                        data = zf.read(name)
                         try:
-                            text = data.decode("utf-8")
+                            text_part = data.decode("utf-8")
                         except UnicodeDecodeError:
                             try:
-                                text = data.decode("latin-1")
+                                text_part = data.decode("latin-1")
                             except Exception:
-                                parts.append(f"=== {name} [binary — skipped] ===")
                                 continue
-                        parts.append(f"=== {name} ===\n{text}")
-                        total += len(text)
-                        if total > 1_000_000:
-                            parts.append("[ZIP extraction stopped — 1 MB text limit reached]")
+                        parts.append(f"=== {name} ===\n{text_part}")
+                        total += len(text_part)
+                        if total >= 1_000_000:
+                            parts.append("[ZIP extraction stopped at 1 MB text budget]")
                             break
                     except Exception as ex:
                         parts.append(f"=== {name} [error: {ex}] ===")
         except zipfile.BadZipFile:
             parts = ["[Invalid ZIP file]"]
-        content = "\n\n".join(parts) if parts else "[Empty ZIP file]"
-        file_type = "text"
-    else:
+        content = "\n\n".join(parts)
+    elif not content_type.startswith("image/"):
         content = raw.decode("utf-8", errors="replace")
-        file_type = "text"
+
+    # Bound persisted extracted text; the raw file remains available for tools.
+    if len(content) > 1_000_000:
+        content = content[:1_000_000] + "\n...[extracted text truncated]"
 
     from .database import save_attachment
-    aid = await save_attachment(
-        conversation_id or "", filename, content_type, content
+    await save_attachment(
+        conversation_id or "",
+        filename,
+        content_type,
+        content,
+        user_id=user["id"],
+        storage_path=str(rel_path).replace("\\", "/"),
+        size_bytes=len(raw),
+        attachment_id=aid,
     )
 
     return {
         "id": aid,
+        "attachment_id": aid,
         "filename": filename,
+        "name": filename,
         "type": file_type,
         "content_type": content_type,
-        "content": content,
         "size": len(raw),
     }
 
@@ -398,6 +408,7 @@ async def delete_workspace_file(
 @app.get("/providers/status")
 async def provider_status(user=Depends(get_current_user)):
     cfg = get_config()
+    from .execution import execution_status
     return {
         "azure_chat": cfg.azure_chat is not None,
         "azure_gpt5": cfg.azure_gpt5 is not None,
@@ -408,7 +419,14 @@ async def provider_status(user=Depends(get_current_user)):
         "vertex": cfg.vertex is not None,
         "vertex_image": cfg.vertex_image is not None,
         "sso": cfg.sso.enabled,
+        "execution": execution_status(),
     }
+
+
+@app.get("/models/catalog")
+async def model_catalog(user=Depends(get_current_user)):
+    from .model_capabilities import runtime_catalog
+    return runtime_catalog(get_config())
 
 
 # ── Workspace settings (Tier 3) ───────────────────────────────────────────────
