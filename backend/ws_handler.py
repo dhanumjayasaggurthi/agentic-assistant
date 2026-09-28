@@ -677,10 +677,13 @@ class WSSession:
                             src = (self._ws_base() / storage_path).resolve()
                             base = self._ws_base().resolve()
                             if src.is_file() and src.is_relative_to(base):
-                                dst = self._conv_workspace(cid) / "uploads" / Path(name).name
+                                safe_name = Path(name).name
+                                aid = att.get("attachment_id") or att.get("id") or "attachment"
+                                stored_name = f"{aid[:12]}_{safe_name}"
+                                dst = self._conv_workspace(cid) / "uploads" / stored_name
                                 dst.parent.mkdir(parents=True, exist_ok=True)
                                 dst.write_bytes(src.read_bytes())
-                                workspace_path = f"uploads/{Path(name).name}"
+                                workspace_path = f"uploads/{stored_name}"
                         except Exception:
                             workspace_path = None
                     header = (
