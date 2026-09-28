@@ -74,6 +74,17 @@ class DatabaseConfig:
 
 
 @dataclass
+class ExecutionConfig:
+    mode: str = "local"  # local for development; docker for production isolation
+    docker_image: str = "python:3.12-slim"
+    network_enabled: bool = False
+    memory_mb: int = 1024
+    cpus: float = 1.0
+    pids_limit: int = 128
+    timeout_seconds: int = 60
+
+
+@dataclass
 class SSOConfig:
     tenant_id: str
     client_id: str
@@ -94,6 +105,7 @@ class AppConfig:
     vertex_image: Optional[VertexImageConfig]
     sso: SSOConfig
     database: Optional[DatabaseConfig]
+    execution: ExecutionConfig
     jwt_secret: str
     workspace_dir: Path
     db_path: Path
@@ -201,6 +213,18 @@ def load_config() -> AppConfig:
             )
         return None
 
+    execution = ExecutionConfig(
+        mode=(os.environ.get("RDI_EXECUTION_MODE") or _get(cfg, "execution", "mode", "local")).strip().lower(),
+        docker_image=os.environ.get("RDI_EXECUTION_IMAGE") or _get(cfg, "execution", "docker_image", "python:3.12-slim"),
+        network_enabled=(os.environ.get("RDI_EXECUTION_NETWORK") or _get(cfg, "execution", "network_enabled", "false")).lower() in ("1", "true", "yes"),
+        memory_mb=int(os.environ.get("RDI_EXECUTION_MEMORY_MB") or _get(cfg, "execution", "memory_mb", "1024")),
+        cpus=float(os.environ.get("RDI_EXECUTION_CPUS") or _get(cfg, "execution", "cpus", "1.0")),
+        pids_limit=int(os.environ.get("RDI_EXECUTION_PIDS") or _get(cfg, "execution", "pids_limit", "128")),
+        timeout_seconds=int(os.environ.get("RDI_EXECUTION_TIMEOUT") or _get(cfg, "execution", "timeout_seconds", "60")),
+    )
+    if execution.mode not in ("local", "docker"):
+        raise RuntimeError("RDI_EXECUTION_MODE must be 'local' or 'docker'")
+
     tenant_id = _get(cfg, "sso", "tenant_id", "YOUR_TENANT_ID")
     sso = SSOConfig(
         tenant_id=tenant_id,
@@ -241,6 +265,7 @@ def load_config() -> AppConfig:
         vertex_image=vertex_image(),
         sso=sso,
         database=database(),
+        execution=execution,
         workspace_dir=workspace_dir,
         db_path=db_path,
         admin_username=_get(cfg, "app", "admin_username", "admin"),
