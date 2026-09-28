@@ -93,10 +93,16 @@ const MODEL_GROUPS = [
 ];
 
 const ALL_MODELS = MODEL_GROUPS.flatMap(g => g.models);
-const modelById = id => ALL_MODELS.find(m => m.id === id);
+let RUNTIME_MODEL_MAP = {};
+const modelById = id => RUNTIME_MODEL_MAP[id] || ALL_MODELS.find(m => m.id === id);
 const modelName = id => (modelById(id) || {}).name || id;
-const isImageModel = id => (modelById(id) || {}).type === 'image';
+const isImageModel = id => {
+  const m = modelById(id) || {};
+  return m.type === 'image' || !!(m.capabilities || {}).image_generation;
+};
 const isNoToolsModel = id => {
+  const live = RUNTIME_MODEL_MAP[id];
+  if (live && live.capabilities) return !live.capabilities.tools;
   const m = (id || '').toLowerCase();
   if ((modelById(id) || {}).noTools) return true;
   if (m.startsWith('o1') || m.startsWith('o3') || m.startsWith('o4')) return true;
@@ -368,15 +374,23 @@ function ModelPalette({ open, onClose, current, onPick, agentMode }) {
           {groups.map(g => (
             <div key={g.group}>
               <div className="palette-group">{g.group}</div>
-              {g.models.map(m => (
-                <div key={m.id} className={'model-row' + (m.id === current ? ' sel' : '')} onClick={() => onPick(m.id)}>
-                  <span className="model-dot" style={{ background: TIER_COLORS[m.tier] }} />
-                  <span className="model-name">{m.name}</span>
-                  <span className="model-id">{m.id}</span>
-                  {isNoToolsModel(m.id) && <span className="no-tools-badge" title="This integration uses a separate tool-capable orchestrator for Agent mode">SPECIALIST</span>}
-                  <span className="model-tier" style={{ color: TIER_COLORS[m.tier] }}>{m.tier.toUpperCase()}</span>
-                </div>
-              ))}
+              {g.models.map(m => {
+                const live = modelById(m.id) || m;
+                const unavailable = live.available === false;
+                return (
+                  <div key={m.id}
+                       className={'model-row' + (m.id === current ? ' sel' : '')}
+                       style={unavailable ? { opacity: 0.48, cursor: 'not-allowed' } : null}
+                       onClick={() => { if (!unavailable) onPick(m.id); }}>
+                    <span className="model-dot" style={{ background: TIER_COLORS[live.tier || m.tier] }} />
+                    <span className="model-name">{live.name || m.name}</span>
+                    <span className="model-id">{m.id}</span>
+                    {unavailable && <span className="no-tools-badge" title="Provider is not configured at runtime">OFFLINE</span>}
+                    {!unavailable && isNoToolsModel(m.id) && <span className="no-tools-badge" title="This integration uses a separate tool-capable orchestrator for Agent mode">SPECIALIST</span>}
+                    <span className="model-tier" style={{ color: TIER_COLORS[live.tier || m.tier] }}>{(live.tier || m.tier).toUpperCase()}</span>
+                  </div>
+                );
+              })}
             </div>
           ))}
           {!groups.length && <div style={{ padding: 24, textAlign: 'center' }} className="dim">No models match</div>}
@@ -1112,6 +1126,7 @@ function App() {
   const [toasts, setToasts] = useState([]);
   const [imgModal, setImgModal] = useState(null);
   const [convSearch, setConvSearch] = useState('');
+  const [, setCatalogVersion] = useState(0);
 
   const streamRef = useRef('');
   const runRef = useRef(null);
@@ -1128,6 +1143,26 @@ function App() {
     setToasts(ts => [...ts, { id, text, err }]);
     setTimeout(() => setToasts(ts => ts.filter(t => t.id !== id)), 4200);
   }, []);
+
+  useEffect(() => {
+    if (!authed) return;
+    Auth.fetchJSON('/models/catalog')
+      .then(items => {
+        RUNTIME_MODEL_MAP = {};
+        (items || []).forEach(m => { RUNTIME_MODEL_MAP[m.id] = m; });
+        setCatalogVersion(v => v + 1);
+        const selected = RUNTIME_MODEL_MAP[modelRef.current];
+        if (selected && selected.available === false) {
+          const fallback = (items || []).find(m => m.available && m.capabilities && m.capabilities.tools)
+            || (items || []).find(m => m.available);
+          if (fallback) {
+            setModel(fallback.id);
+            modelRef.current = fallback.id;
+          }
+        }
+      })
+      .catch(() => {});
+  }, [authed]);
 
   /* ── WS wiring ── */
   useEffect(() => {
@@ -1317,7 +1352,14 @@ function App() {
     fetch('/files/upload', { method: 'POST', headers: Auth.authHeaders(), body: form })
       .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
       .then(d => setAttachments(list => list.map(a => a.key === key
-        ? { ...a, status: 'done', payload: { name: d.filename, type: d.content_type, content: d.content } } : a)))
+        ? { ...a, status: 'done', payload: {
+            id: d.attachment_id || d.id,
+            attachment_id: d.attachment_id || d.id,
+            name: d.filename,
+            type: d.content_type,
+            content_type: d.content_type,
+            size: d.size,
+          } } : a)))
       .catch(() => setAttachments(list => list.map(a => a.key === key ? { ...a, status: 'failed' } : a)));
   }, []);
 
