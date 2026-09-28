@@ -190,6 +190,7 @@ class WSSession:
                 "type": content_type,
                 "content_type": content_type,
                 "size": row.get("size_bytes") or ref.get("size") or 0,
+                "storage_path": row.get("storage_path"),
             }
             if content_type.startswith("image/"):
                 storage_path = row.get("storage_path")
@@ -660,7 +661,24 @@ class WSSession:
                     except Exception:
                         parts.append(f"[Attached image: {name}]")
                 else:
-                    parts.append(f"--- Attached file: {name} ---\n{content}\n---")
+                    workspace_path = None
+                    storage_path = att.get("storage_path")
+                    if storage_path:
+                        try:
+                            src = (self._ws_base() / storage_path).resolve()
+                            base = self._ws_base().resolve()
+                            if src.is_file() and src.is_relative_to(base):
+                                dst = self._conv_workspace(cid) / "uploads" / Path(name).name
+                                dst.parent.mkdir(parents=True, exist_ok=True)
+                                dst.write_bytes(src.read_bytes())
+                                workspace_path = f"uploads/{Path(name).name}"
+                        except Exception:
+                            workspace_path = None
+                    header = (
+                        f"[Attached file materialized at workspace/{workspace_path}]\n"
+                        if workspace_path else ""
+                    )
+                    parts.append(f"{header}--- Attached file: {name} ---\n{content}\n---")
             if parts:
                 enriched_msg = "\n\n".join(parts) + "\n\n" + user_msg
 
