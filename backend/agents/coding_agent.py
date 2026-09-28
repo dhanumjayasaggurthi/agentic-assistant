@@ -83,18 +83,21 @@ async def run_coding_agent(
     # Standard agentic loop
     final_answer = ""
     for turn in range(MAX_TURNS):
-        resp = await _complete_with_tools(messages, model, provider)
+        resp = await _complete_with_tools(
+            messages, model, provider, token_callback=token_callback
+        )
         content = resp.get("content", "")
         tool_calls = resp.get("tool_calls") or []
         finish = resp.get("finish_reason", "stop")
 
-        # Stream any text content — in small chunks, not per-character (the
-        # underlying completion is non-streaming, so per-char just floods WS frames).
+        # Azure planning/final turns stream directly. Other providers still
+        # return complete text, which we emit in bounded chunks.
         if content:
-            _chunk = 48
-            for i in range(0, len(content), _chunk):
-                await token_callback(content[i:i + _chunk])
-                await asyncio.sleep(0)  # yield event loop
+            if not resp.get("streamed"):
+                _chunk = 48
+                for i in range(0, len(content), _chunk):
+                    await token_callback(content[i:i + _chunk])
+                    await asyncio.sleep(0)
             final_answer = content
 
         if finish == "stop" or not tool_calls:
@@ -173,43 +176,113 @@ def _normalize_tool_call(tc):
     return tid, fn.name, args, raw
 
 
-async def _complete_with_tools(messages: List[Dict], model: str, provider: str) -> dict:
+async def _stream_openai_with_tools(client, kwargs: Dict,
+                                    token_callback: Callable[[str], asyncio.Future]) -> dict:
+    """Stream assistant text while accumulating function-call deltas."""
+    kwargs = dict(kwargs)
+    kwargs["stream"] = True
+    stream = await client.chat.completions.create(**kwargs)
+    content_parts: List[str] = []
+    tool_parts: Dict[int, Dict] = {}
+    finish_reason = "stop"
+
+    async for chunk in stream:
+        if not chunk.choices:
+            continue
+        choice = chunk.choices[0]
+        delta = choice.delta
+        if delta.content:
+            content_parts.append(delta.content)
+            await token_callback(delta.content)
+        for tc in (getattr(delta, "tool_calls", None) or []):
+            idx = getattr(tc, "index", 0) or 0
+            entry = tool_parts.setdefault(idx, {"id": "", "name": "", "arguments": ""})
+            if getattr(tc, "id", None):
+                entry["id"] = tc.id
+            fn = getattr(tc, "function", None)
+            if fn is not None:
+                if getattr(fn, "name", None):
+                    entry["name"] += fn.name
+                if getattr(fn, "arguments", None):
+                    entry["arguments"] += fn.arguments
+        if choice.finish_reason:
+            finish_reason = choice.finish_reason
+
+    tool_calls = []
+    for idx in sorted(tool_parts):
+        part = tool_parts[idx]
+        try:
+            args = json.loads(part["arguments"] or "{}")
+        except Exception:
+            args = {}
+        tool_calls.append({
+            "id": part["id"] or str(uuid.uuid4()),
+            "name": part["name"],
+            "input": args,
+        })
+
+    return {
+        "content": "".join(content_parts),
+        "tool_calls": tool_calls or None,
+        "finish_reason": finish_reason,
+        "streamed": True,
+    }
+
+
+async def _complete_with_tools(messages: List[Dict], model: str, provider: str,
+                               token_callback=None) -> dict:
     if provider == "azure_chat":
+        from ..providers.azure_chat import _client
+        client = _client()
+        kwargs = {
+            "model": model,
+            "messages": messages,
+            "tools": TOOL_DEFINITIONS,
+            "tool_choice": "auto",
+            "max_tokens": 8192,
+        }
+        if token_callback:
+            return await _stream_openai_with_tools(client, kwargs, token_callback)
         from ..providers.azure_chat import complete_with_tools
-        return await complete_with_tools(messages, model, TOOL_DEFINITIONS)
+        return await complete_with_tools(messages, model, TOOL_DEFINITIONS, max_tokens=8192)
+
     elif provider == "gpt5":
-        # GPT-5 chat models support tool calling
         from openai import AsyncAzureOpenAI
         from ..config import get_config
         cfg = get_config().azure_gpt5
         if not cfg:
             raise RuntimeError("Azure GPT-5 not configured")
-        c = AsyncAzureOpenAI(
+        client = AsyncAzureOpenAI(
             api_key=cfg.api_key,
             azure_endpoint=cfg.endpoint,
             api_version=cfg.api_version,
         )
-        resp = await c.chat.completions.create(
-            model=model,
-            messages=messages,
-            tools=TOOL_DEFINITIONS,
-            tool_choice="auto",
-            max_completion_tokens=8192,
-        )
+        kwargs = {
+            "model": model,
+            "messages": messages,
+            "tools": TOOL_DEFINITIONS,
+            "tool_choice": "auto",
+            "max_completion_tokens": 8192,
+        }
+        if token_callback:
+            return await _stream_openai_with_tools(client, kwargs, token_callback)
+        resp = await client.chat.completions.create(**kwargs)
         choice = resp.choices[0]
         return {
             "content": choice.message.content or "",
             "tool_calls": choice.message.tool_calls,
             "finish_reason": choice.finish_reason,
         }
+
     elif provider == "bedrock":
         from ..providers.bedrock import complete_bedrock
         sys_msg = next((m["content"] for m in messages if m.get("role") == "system"), None)
         user_msgs = [m for m in messages if m.get("role") != "system"]
-        return await complete_bedrock(user_msgs, model, system_prompt=sys_msg,
-                                      tools=TOOL_DEFINITIONS)
+        return await complete_bedrock(
+            user_msgs, model, system_prompt=sys_msg, tools=TOOL_DEFINITIONS
+        )
+
     else:
-        # Vertex doesn't support tool calling on RDI gateway — fallback to plain completion
         from ..providers.vertex import complete_vertex
         return await complete_vertex(messages, model)
 
