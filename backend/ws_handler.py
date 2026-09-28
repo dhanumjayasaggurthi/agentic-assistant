@@ -926,8 +926,9 @@ class WSSession:
             await self.send_error("Image prompt required")
             return
 
+        hydrated_atts = await self._hydrate_attachments(atts)
         gen_prompt = prompt
-        doc_context = _attachments_context(atts, limit=3000)
+        doc_context = _attachments_context(hydrated_atts, limit=3000)
         if doc_context:
             gen_prompt = f"{prompt}\n\nReference context:\n{doc_context}"
 
@@ -946,8 +947,22 @@ class WSSession:
 
         results = []
         try:
+            reference_image = next(
+                (a for a in hydrated_atts if (a.get("type") or "").startswith("image/") and a.get("content")),
+                None,
+            )
             for i in range(count):
-                if model == "gemini-2.5-flash-image":
+                if reference_image and model.startswith("gpt-image"):
+                    result = await edit_image(
+                        base64.b64decode(reference_image["content"]),
+                        None,
+                        gen_prompt,
+                        model=model,
+                        size=size,
+                    )
+                    b64 = result.get("b64")
+                    url = result.get("url")
+                elif model == "gemini-2.5-flash-image":
                     result = await generate_vertex_image(gen_prompt, model)
                     b64 = result.get("b64")
                     url = None
