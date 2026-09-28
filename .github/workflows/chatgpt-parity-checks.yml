@@ -27,7 +27,7 @@ jobs:
         run: python -m compileall -q backend
 
       - name: Model capability unit tests
-        run: python -m unittest -v tests.test_model_capabilities tests.test_phase2_architecture
+        run: python -m unittest -v tests.test_model_capabilities tests.test_phase2_architecture tests.test_user_journeys
 
       - name: Check WebSocket client syntax
         run: node --check frontend/js/ws.js
