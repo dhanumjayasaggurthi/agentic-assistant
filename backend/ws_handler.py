@@ -40,10 +40,11 @@ from .config import get_config
 from .model_capabilities import model_supports_tools, preferred_agent_orchestrator
 from .database import (
     add_message, auto_title, checkpoint_run, create_conversation, create_run,
-    delete_conversation, finish_run, get_conversation, get_latest_run,
-    get_messages, get_other_conversation_summaries, get_user_by_id,
-    list_artifacts, list_conversations, record_usage, register_artifact,
-    set_user_workspace, update_conversation_meta,
+    bind_attachments_to_conversation, delete_conversation, finish_run,
+    get_attachment, get_conversation, get_latest_run, get_messages,
+    get_other_conversation_summaries, get_user_by_id, list_artifacts,
+    list_conversations, record_usage, register_artifact, set_user_workspace,
+    update_conversation_meta,
 )
 from .providers.azure_audio import text_to_speech_b64, transcribe
 from .providers.azure_image import edit_image, generate_image
@@ -161,6 +162,56 @@ class WSSession:
         ws = (self._ws_base() / cid) if cid else self._ws_base()
         ws.mkdir(parents=True, exist_ok=True)
         return ws
+
+    async def _hydrate_attachments(self, attachments: List[Dict]) -> List[Dict]:
+        """Resolve lightweight attachment handles into model-ready content.
+
+        The client carries only attachment IDs/metadata. Ownership is enforced
+        in the database lookup; raw image bytes and extracted document text are
+        loaded server-side only when needed by a model turn.
+        """
+        hydrated: List[Dict] = []
+        for ref in attachments or []:
+            if not isinstance(ref, dict):
+                continue
+            aid = ref.get("attachment_id") or ref.get("id")
+            if not aid:
+                # Backward compatibility with historical inline attachments.
+                hydrated.append(ref)
+                continue
+            row = await get_attachment(aid, self.user["id"])
+            if not row:
+                continue
+            content_type = row.get("content_type") or ref.get("content_type") or "text/plain"
+            item = {
+                "id": aid,
+                "attachment_id": aid,
+                "name": row.get("filename") or ref.get("name") or "file",
+                "type": content_type,
+                "content_type": content_type,
+                "size": row.get("size_bytes") or ref.get("size") or 0,
+            }
+            if content_type.startswith("image/"):
+                storage_path = row.get("storage_path")
+                if storage_path:
+                    p = (self._ws_base() / storage_path).resolve()
+                    base = self._ws_base().resolve()
+                    if p.is_file() and (p == base or p.is_relative_to(base)):
+                        item["content"] = base64.b64encode(p.read_bytes()).decode()
+            else:
+                item["content"] = row.get("content") or ""
+            hydrated.append(item)
+        return hydrated
+
+    async def _hydrate_history(self, history: List[Dict], max_messages: int = 10) -> List[Dict]:
+        result: List[Dict] = []
+        start = max(0, len(history) - max_messages)
+        for i, msg in enumerate(history):
+            copy = dict(msg)
+            if i >= start and copy.get("role") == "user" and copy.get("attachments"):
+                copy["attachments"] = await self._hydrate_attachments(copy["attachments"])
+            result.append(copy)
+        return result
 
     # ── Send helpers ──────────────────────────────────────────────────────────
 
@@ -446,6 +497,16 @@ class WSSession:
         st.task = asyncio.current_task()
 
         norm_atts = _normalize_attachments(attachments)
+        attachment_ids = [
+            a.get("attachment_id") or a.get("id")
+            for a in norm_atts
+            if a.get("attachment_id") or a.get("id")
+        ]
+        await bind_attachments_to_conversation(attachment_ids, cid, self.user["id"])
+        model_atts = await self._hydrate_attachments(norm_atts)
+
+        # Persist only handles/metadata; never persist another duplicate copy in
+        # the message JSON when the attachment service already owns the content.
         await add_message(cid, "user", user_msg, attachments=norm_atts or None)
         if len(self.history) == 0:
             await auto_title(cid, user_msg)
@@ -455,14 +516,14 @@ class WSSession:
 
         agent_mode = bool(data.get("agent_mode", False))
         auto_agent = bool(data.get("auto_agent", True))
-        if not agent_mode and auto_agent and _should_auto_agent(user_msg, norm_atts):
+        if not agent_mode and auto_agent and _should_auto_agent(user_msg, model_atts):
             agent_mode = True
             await st.emit({
                 "type": "auto_agent_started",
                 "reason": "This request requires tools or workspace actions, so it was promoted to an agent run.",
             })
         if agent_mode:
-            await self._run_coding_agent(user_msg, model, cid, st, attachments=norm_atts)
+            await self._run_coding_agent(user_msg, model, cid, st, attachments=model_atts)
             return
 
         # ── Plain chat ────────────────────────────────────────────────────────
@@ -471,7 +532,8 @@ class WSSession:
         await st.emit({"type": "activity", "action": "Connecting to model…", "icon": "🔗"})
 
         sys_prefix = await self._cross_chat_prefix(cid)
-        messages = build_messages(self.history[:-1], user_msg, norm_atts or None,
+        hydrated_history = await self._hydrate_history(self.history[:-1])
+        messages = build_messages(hydrated_history, user_msg, model_atts or None,
                                   system_prefix=sys_prefix)
         full_response = ""
         try:
@@ -732,8 +794,9 @@ class WSSession:
         cancelled = False
         err_text = None
         try:
+            hydrated_history = await self._hydrate_history(self.history[:-1])
             await run_coding_agent(
-                enriched_msg, self.history[:-1], run_model,
+                enriched_msg, hydrated_history, run_model,
                 permission_fn=_perm_fn,
                 token_callback=_token_cb,
                 tool_result_callback=_result_cb,
@@ -1060,9 +1123,22 @@ def _normalize_attachments(attachments) -> List[Dict]:
         if not isinstance(att, dict):
             continue
         name = att.get("name") or att.get("filename") or "file"
-        typ = att.get("type") or att.get("content_type") or "text"
-        content = att.get("content", "")
-        out.append({"name": name, "type": typ, "content": content})
+        typ = att.get("content_type") or att.get("type") or "text"
+        item = {
+            "name": name,
+            "type": typ,
+            "content_type": typ,
+        }
+        aid = att.get("attachment_id") or att.get("id")
+        if aid:
+            item["id"] = aid
+            item["attachment_id"] = aid
+        if att.get("size") is not None:
+            item["size"] = att.get("size")
+        # Legacy clients may still send inline content; keep compatibility.
+        if att.get("content"):
+            item["content"] = att.get("content")
+        out.append(item)
     return out
 
 
