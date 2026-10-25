@@ -27,7 +27,9 @@ const RdiWS = (() => {
   function on(type, fn) { _handlers[type] = fn; }
 
   function dispatch(data) {
-    // Track stream position for resume.
+    // A socket may carry late events from a previous conversation. Ignore them
+    // BEFORE updating sequence numbers or handing them to React.
+    if (data.conversation_id && data.conversation_id !== _activeConv) return;
     if (typeof data.seq === 'number' && data.seq > _lastSeq) _lastSeq = data.seq;
     const fn = _handlers[data.type] || _handlers['*'];
     if (fn) fn(data);
@@ -138,6 +140,10 @@ const RdiWS = (() => {
 
   function queuedCount() { return _queue.length; }
 
+  function dropPending(requestId) {
+    if (requestId) _queue = _queue.filter(m => m.request_id !== requestId);
+  }
+
   function disconnect() {
     _intentionalClose = true;
     if (_reconnectTimer) { clearTimeout(_reconnectTimer); _reconnectTimer = null; }
@@ -152,5 +158,5 @@ const RdiWS = (() => {
   function isConnected() { return _connected; }
 
   return { on, connect, send, disconnect, isConnected,
-           setActiveConversation, queuedCount };
+           setActiveConversation, queuedCount, dropPending };
 })();
