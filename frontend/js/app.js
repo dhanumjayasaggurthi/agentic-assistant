@@ -651,6 +651,8 @@ function Composer({ conv, agentMode, model, onOpenModel, onSend, onStop, busy, d
   };
 
   const submit = () => {
+    // Never silently discard a file still uploading or one that failed.
+    if (attachments.some(a => a.status !== 'done')) return;
     const ready = attachments.filter(a => a.status === 'done');
     if ((!text.trim() && !ready.length) || busy || disabled) return;
     onSend(text.trim(), ready);
@@ -770,7 +772,11 @@ function Composer({ conv, agentMode, model, onOpenModel, onSend, onStop, busy, d
               {attachments.map(a => (
                 <span key={a.key} className={'att-chip ' + a.status}>
                   <span className="sq" style={{ background: a.status === 'done' ? 'var(--ok)' : a.status === 'failed' ? 'var(--red)' : 'var(--warn)' }} />
-                  {a.name}{a.status === 'uploading' ? ' — uploading…' : a.status === 'failed' ? ' — upload failed' : ''}
+                  {a.name}
+                  {a.status === 'uploading' ? ' — uploading…' : ''}
+                  {a.status === 'failed' ? ` — ${a.error || 'upload failed'}` : ''}
+                  {a.status === 'done' && a.extraction?.complete === false
+                    ? ` — original saved; ${a.extraction.note || 'text extraction unavailable'}` : ''}
                   {a.status === 'failed' && <button className="att-retry" onClick={() => uploadFile(a.file, a.key)}>retry</button>}
                   <button className="x" onClick={() => setAttachments(list => list.filter(x => x.key !== a.key))}>✕</button>
                 </span>
@@ -794,7 +800,8 @@ function Composer({ conv, agentMode, model, onOpenModel, onSend, onStop, busy, d
             {busy
               ? <button className="btn-send" title="Stop" onClick={onStop}><Ic.stop /></button>
               : <button className="btn-send" title="Send" onClick={submit}
-                        disabled={disabled || (!text.trim() && !attachments.some(a => a.status === 'done'))}><Ic.send /></button>}
+                        disabled={disabled || attachments.some(a => a.status !== 'done') ||
+                          (!text.trim() && !attachments.some(a => a.status === 'done'))}><Ic.send /></button>}
           </div>
         </div>
         <div className="composer-hints">
@@ -1273,6 +1280,7 @@ function App() {
   const [conn, setConn] = useState('connecting');
   const [connAttempt, setConnAttempt] = useState(0);
   const [attachments, setAttachments] = useState([]);
+  const [dragOver, setDragOver] = useState(false);
   const [crossChat, setCrossChat] = useState(false);
   const [wsFiles, setWsFiles] = useState([]);
   const [wsMode, setWsMode] = useState('cloud');
@@ -1595,7 +1603,7 @@ function App() {
   };
 
   const uploadFile = useCallback((file, existingKey) => {
-    const key = existingKey || `${file.name}-${Date.now()}`;
+    const key = existingKey || `${file.name}-${file.size}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
     setAttachments(list => {
       const rest = list.filter(a => a.key !== key);
       return [...rest, { key, name: file.name, file, status: 'uploading' }];
@@ -1604,9 +1612,16 @@ function App() {
     form.append('file', file);
     if (convRef.current) form.append('conversation_id', convRef.current);
     fetch('/files/upload', { method: 'POST', headers: Auth.authHeaders(), body: form })
-      .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
+      .then(async response => {
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          throw new Error(typeof payload.detail === 'string'
+            ? payload.detail : `Upload failed (HTTP ${response.status})`);
+        }
+        return payload;
+      })
       .then(d => setAttachments(list => list.map(a => a.key === key
-        ? { ...a, status: 'done', payload: {
+        ? { ...a, status: 'done', extraction: d.extraction, payload: {
             id: d.attachment_id || d.id,
             attachment_id: d.attachment_id || d.id,
             name: d.filename,
@@ -1614,8 +1629,49 @@ function App() {
             content_type: d.content_type,
             size: d.size,
           } } : a)))
-      .catch(() => setAttachments(list => list.map(a => a.key === key ? { ...a, status: 'failed' } : a)));
+      .catch(err => setAttachments(list => list.map(a => a.key === key
+        ? { ...a, status: 'failed', error: err.message } : a)));
   }, []);
+
+  useEffect(() => {
+    // Native file-drop works anywhere in the app, not just over the composer.
+    // Prevent the browser from navigating away when dropping a spreadsheet.
+    let depth = 0;
+    const hasFiles = event => Array.from(event.dataTransfer?.types || []).includes('Files');
+    const enter = event => {
+      if (!hasFiles(event)) return;
+      event.preventDefault();
+      depth += 1; setDragOver(true);
+    };
+    const over = event => {
+      if (!hasFiles(event)) return;
+      event.preventDefault();
+      event.dataTransfer.dropEffect = 'copy';
+    };
+    const leave = event => {
+      if (!hasFiles(event)) return;
+      depth = Math.max(0, depth - 1);
+      if (depth === 0) setDragOver(false);
+    };
+    const drop = event => {
+      if (!hasFiles(event)) return;
+      event.preventDefault();
+      depth = 0; setDragOver(false);
+      for (const file of Array.from(event.dataTransfer?.files || [])) {
+        uploadFile(file);
+      }
+    };
+    window.addEventListener('dragenter', enter);
+    window.addEventListener('dragover', over);
+    window.addEventListener('dragleave', leave);
+    window.addEventListener('drop', drop);
+    return () => {
+      window.removeEventListener('dragenter', enter);
+      window.removeEventListener('dragover', over);
+      window.removeEventListener('dragleave', leave);
+      window.removeEventListener('drop', drop);
+    };
+  }, [uploadFile]);
 
   const sendMessage = (text, atts) => {
     const payloadAtts = atts.map(a => a.payload).filter(Boolean);
@@ -1731,6 +1787,9 @@ function App() {
   return (
     <React.Fragment>
       <div className="red-hairline" />
+      {dragOver && <div className="file-drop-indicator" role="status">
+        Drop files to attach to this conversation
+      </div>}
       <div className="app-frame">
         {/* Ink rail */}
         <div className="rail">
