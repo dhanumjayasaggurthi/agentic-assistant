@@ -630,8 +630,14 @@ class WSSession:
         # report any necessary orchestrator fallback to the user.
         has_documents = any(not (a.get("type") or "").startswith("image/")
                             for a in model_atts)
+        prior_documents = any(
+            (a.get("type") or a.get("content_type") or "").startswith(("text/", "application/"))
+            or not (a.get("type") or a.get("content_type") or "").startswith("image/")
+            for m in history if m.get("role") == "user"
+            for a in m.get("attachments") or [] if isinstance(a, dict)
+        )
         long_context = sum(len(str(m.get("content", ""))) for m in history) > 100_000
-        if not agent_mode and (has_documents or long_context or
+        if not agent_mode and (has_documents or prior_documents or long_context or
                                (auto_agent and _should_auto_agent(user_msg, model_atts))):
             agent_mode = True
             await st.emit({
