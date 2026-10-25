@@ -42,14 +42,14 @@ def export_pdf(title: str, messages: list) -> io.BytesIO:
     pdf.add_font("RDI", "B", str(bold))
     pdf.add_page()
     pdf.set_font("RDI", "B", 16)
-    pdf.multi_cell(0, 9, title, wrapmode="CHAR")
+    pdf.multi_cell(0, 9, title, wrapmode="CHAR", new_x="LMARGIN", new_y="NEXT")
     pdf.ln(6)
 
     for item in messages:
         role = (item.get("role") or "assistant").upper()
         pdf.set_font("RDI", "B", 10)
         pdf.set_text_color(100, 60, 65) if role == "USER" else pdf.set_text_color(55, 60, 120)
-        pdf.multi_cell(0, 7, role, wrapmode="CHAR")
+        pdf.multi_cell(0, 7, role, wrapmode="CHAR", new_x="LMARGIN", new_y="NEXT")
         pdf.set_text_color(30, 30, 30)
         in_code = False
         for line in _lines(item.get("content") or ""):
@@ -57,22 +57,22 @@ def export_pdf(title: str, messages: list) -> io.BytesIO:
             if stripped.startswith("```") or stripped.startswith("~~~"):
                 in_code = not in_code
                 pdf.set_font("RDI", "", 8)
-                pdf.multi_cell(0, 5, line, wrapmode="CHAR")
+                pdf.multi_cell(0, 5, line, wrapmode="CHAR", new_x="LMARGIN", new_y="NEXT")
                 continue
             if in_code:
                 pdf.set_font("RDI", "", 8)
-                pdf.multi_cell(0, 5, line or " ", wrapmode="CHAR")
+                pdf.multi_cell(0, 5, line or " ", wrapmode="CHAR", new_x="LMARGIN", new_y="NEXT")
             elif stripped.startswith("#"):
                 depth = len(stripped) - len(stripped.lstrip("#"))
                 if depth <= 6 and stripped[depth:depth + 1] == " ":
                     pdf.set_font("RDI", "B", max(10, 15 - depth))
-                    pdf.multi_cell(0, 7, stripped[depth + 1:], wrapmode="CHAR")
+                    pdf.multi_cell(0, 7, stripped[depth + 1:], wrapmode="CHAR", new_x="LMARGIN", new_y="NEXT")
                 else:
                     pdf.set_font("RDI", "", 10)
-                    pdf.multi_cell(0, 6, line or " ", wrapmode="CHAR")
+                    pdf.multi_cell(0, 6, line or " ", wrapmode="CHAR", new_x="LMARGIN", new_y="NEXT")
             else:
                 pdf.set_font("RDI", "", 10)
-                pdf.multi_cell(0, 6, line or " ", wrapmode="CHAR")
+                pdf.multi_cell(0, 6, line or " ", wrapmode="CHAR", new_x="LMARGIN", new_y="NEXT")
         pdf.ln(5)
 
     buf = io.BytesIO(pdf.output())
