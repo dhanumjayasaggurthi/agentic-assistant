@@ -36,7 +36,11 @@ const RdiWS = (() => {
     // BEFORE updating sequence numbers or handing them to React.
     const relevant = !data.conversation_id || data.conversation_id === _activeConv;
     if (relevant) {
-      if (typeof data.seq === 'number' && data.seq > _lastSeq) _lastSeq = data.seq;
+      // Ignore duplicate or late replayed tokens after a reconnect/load snapshot.
+      if (typeof data.seq === 'number') {
+        if (data.seq <= _lastSeq) return;
+        _lastSeq = data.seq;
+      }
       const fn = _handlers[data.type] || _handlers['*'];
       if (fn) fn(data);
     }
