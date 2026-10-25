@@ -85,6 +85,7 @@ class StreamState:
         self.key = key
         self.seq = 0
         self.buffer: deque = deque(maxlen=_BUFFER_SIZE)
+        self.partial_text = ""  # full active turn, not the bounded replay buffer
         self.session: Optional["WSSession"] = None
         self.running = False
         self.run_id: Optional[str] = None
@@ -103,6 +104,8 @@ class StreamState:
             self.seq += 1
             data["seq"] = self.seq
             self.buffer.append(data)
+            if data.get("type") == "token":
+                self.partial_text += data.get("text", "")
             sess = self.session
             if sess is not None:
                 try:
@@ -353,12 +356,17 @@ class WSSession:
             return
         async with st._emit_lock:
             st.session = self
-            replay = st.replay_after(last_seq)
+            # A bounded event replay may have rolled over: never silently
+            # present only the last N tokens as though they were the full answer.
+            gap = bool(st.buffer and last_seq < st.buffer[0].get("seq", 1) - 1)
+            replay = [] if gap else st.replay_after(last_seq)
             await self.send({
                 "type": "resume_ok", "conversation_id": cid,
                 "running": st.running,
                 "replayed": len(replay),
                 "current_seq": st.seq,
+                "snapshot": st.partial_text if gap and st.running else None,
+                "reload_required": bool(gap and not st.running),
             })
             for ev in replay:
                 try:
@@ -429,7 +437,7 @@ class WSSession:
         if st is not None:
             st.session = self
         run = await get_latest_run(cid)
-        partial_text = "".join(ev.get("text", "") for ev in st.buffer if ev.get("type") == "token") if st and st.running else ""
+        partial_text = st.partial_text if st and st.running else ""
         activity_log = [
             {"action": ev.get("action", "Working…"), "icon": ev.get("icon", "·")}
             for ev in st.buffer if ev.get("type") == "activity"
@@ -574,6 +582,7 @@ class WSSession:
             return
         st.task = asyncio.current_task()
         st.running = True
+        st.partial_text = ""
 
         # History belongs to this conversation, never to a mutable WebSocket session.
         previous = await get_messages(cid)
@@ -626,7 +635,7 @@ class WSSession:
             full_response = await self._stream_with_retry(st, messages, model)
         except asyncio.CancelledError:
             # Keep actually generated partial text when a user presses Stop.
-            partial = "".join(ev.get("text", "") for ev in st.buffer if ev.get("type") == "token")
+            partial = st.partial_text
             if partial:
                 await add_message(cid, "assistant", partial)
             st.running = False
