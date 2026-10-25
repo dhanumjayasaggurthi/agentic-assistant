@@ -6,6 +6,7 @@ on:
       - fix/chat-stream-progress-conversation-isolation-20261025
       - fix/rich-visual-exports-permissions-no-silent-loss-20261025
       - fix/visual-artifacts-rendering-20261025
+      - fix/reliable-upload-batch-context-20261025
   pull_request:
     branches:
       - feature/chatgpt-parity-phase2-2026-09-27
@@ -46,6 +47,8 @@ jobs:
           node tests/visual_dom_smoke.mjs
       - name: Verify permissions and unstripped exports
         run: python -m unittest -v tests.test_rich_export_permissions
+      - name: Test real spreadsheet uploads, long CSV and paginated retrieval
+        run: python -m unittest -v tests.test_upload_ingestion
       - name: Compile frontend JSX (syntax and structure)
         run: |
           npx --yes esbuild@0.25.12 frontend/js/app.js --loader:.js=jsx --outfile=/tmp/rdi-app-syntax-check.js
