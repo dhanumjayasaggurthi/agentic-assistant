@@ -69,13 +69,24 @@ async def run_coding_agent(
         if atts:
             content = attachments_to_text(atts) + "\n\n" + content
         if len(content) > 40_000:
-            content = content[:40_000] + "\n...[older attachment/context truncated]"
+            raise ValueError(
+                "A single agent history message exceeds 40,000 characters. "
+                "No content was silently truncated; analyze a selected section or use file tools."
+            )
         cost = len(content)
-        if selected and used + cost > budget:
-            break
+        if used + cost > budget:
+            raise ValueError(
+                f"Agent history exceeds the {budget:,}-character model context limit. "
+                "No earlier messages were dropped. Start a new conversation or reduce context."
+            )
         selected.append({"role": m["role"], "content": content})
         used += cost
     messages.extend(reversed(selected))
+    if used + len(user_message) > budget:
+        raise ValueError(
+            f"Agent input exceeds the {budget:,}-character context limit. "
+            "Input was not truncated or partially sent. Select a smaller section."
+        )
     messages.append({"role": "user", "content": user_message})
 
     provider = _route(model)
