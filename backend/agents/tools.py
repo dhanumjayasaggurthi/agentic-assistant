@@ -50,7 +50,8 @@ TOOL_DEFINITIONS: List[Dict] = [
                     "path": {"type": "string", "description": "Relative path within workspace/"},
                     "start_line": {"type": "integer", "description": "Optional 1-based start line"},
                     "end_line": {"type": "integer", "description": "Optional 1-based end line"},
-                    "max_chars": {"type": "integer", "description": "Maximum characters to return", "default": 20000},
+                    "start_char": {"type": "integer", "description": "Optional offset within start_line for rows longer than one response", "default": 0},
+                    "max_chars": {"type": "integer", "description": "Maximum characters to return", "default": 12000},
                 },
                 "required": ["path"],
             },
@@ -498,10 +499,9 @@ async def _read_file(args: Dict) -> str:
     if not path.is_file():
         return f"File not found: {args['path']}"
     start = max(1, int(args.get("start_line") or 1))
-    stop = int(args.get("end_line") or start + 199)
-    stop = max(start, stop)
+    stop = max(start, int(args.get("end_line") or start + 199))
+    offset = max(0, int(args.get("start_char") or 0))
     max_chars = max(1000, min(int(args.get("max_chars") or 12000), 18000))
-    # Stream lines instead of loading a 64 MB extracted document into memory.
     selected = []
     count = 0
     last = start - 1
@@ -513,17 +513,30 @@ async def _read_file(args: Dict) -> str:
             if number > stop:
                 next_line = number
                 break
-            record = f"[{number}] {line.rstrip()}"
-            if count + len(record) > max_chars:
+            original_line = line.removesuffix("\n").removesuffix("\r")
+            current_offset = offset if number == start else 0
+            if current_offset > len(original_line):
+                return f"Invalid start_char for line {number}: line has {len(original_line)} characters."
+            remaining = max_chars - count - len(f"[{number}] ")
+            if remaining <= 0:
                 next_line = number
                 break
-            selected.append(record)
-            count += len(record) + 1
+            portion = original_line[current_offset:]
+            if len(portion) > remaining:
+                if not selected:
+                    # One exceptionally long row: use char offsets without
+                    # losing any part of the actual source line.
+                    chunk = portion[:remaining]
+                    return (f"Source: {args['path']} line {number}, chars "
+                            f"{current_offset}-{current_offset + len(chunk) - 1}.\n"
+                            f"[{number}] {chunk}\n"
+                            f"NEXT_START_LINE={number} NEXT_START_CHAR={current_offset + len(chunk)}")
+                next_line = number
+                break
+            selected.append(f"[{number}] {portion}")
+            count += len(portion) + len(f"[{number}] ") + 1
             last = number
-    if last < start and next_line == start:
-        return (f"Line {start} exceeds the {max_chars}-character per-call limit. "
-                "Use file_overview, search_files, or a targeted read.")
-    suffix = (f" NEXT_START_LINE={next_line} (read_file again to continue)"
+    suffix = (f" NEXT_START_LINE={next_line} NEXT_START_CHAR=0"
               if next_line else " END_OF_FILE")
     return f"Source: {args['path']} lines {start}-{last}.\n" + "\n".join(selected) + "\n" + suffix
 
