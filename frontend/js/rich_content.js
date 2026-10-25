@@ -15,11 +15,16 @@ const RdiRichContent = (() => {
     try { config = JSON.parse(code); } catch (_) { return null; }
     if (!config || !['bar', 'line', 'pie', 'doughnut', 'scatter'].includes(config.type)) return null;
     const input = config.data || {};
-    if (!Array.isArray(input.datasets) || input.datasets.length > 12) return null;
-    const labels = Array.isArray(input.labels) ? input.labels.map(String).slice(0, 500) : [];
+    if (!Array.isArray(input.datasets)) return null;
+    const count = Math.max((input.labels || []).length,
+      ...input.datasets.map(ds => Array.isArray(ds.data) ? ds.data.length : 0));
+    if (input.datasets.length > 12 || count > 500) {
+      throw new Error('Chart exceeds the 12-series / 500-point browser display limit; source is preserved.');
+    }
+    const labels = Array.isArray(input.labels) ? input.labels.map(String) : [];
     const datasets = input.datasets.map(ds => ({
       label: String(ds.label || ''),
-      data: (Array.isArray(ds.data) ? ds.data : []).slice(0, 500).map(value => {
+      data: (Array.isArray(ds.data) ? ds.data : []).map(value => {
         if (config.type === 'scatter' && value && typeof value === 'object') {
           return { x: Number(value.x), y: Number(value.y) };
         }
@@ -86,7 +91,14 @@ const RdiRichContent = (() => {
       const language = (codeEl.className.match(/language-([\w-]+)/) || [,''])[1].toLowerCase();
       const source = codeEl.textContent || '';
       const isDiagram = isMermaidCode(source, language);
-      const chart = parseChart(source, language);
+      let chart = null;
+      try { chart = parseChart(source, language); }
+      catch (err) {
+        const notice = document.createElement('p');
+        notice.className = 'rich-error'; notice.textContent = err.message;
+        originalPre?.insertAdjacentElement('afterend', notice);
+        continue; // Original full code remains visible and copyable.
+      }
       if (!isDiagram && !chart) continue;
       const originalPre = codeEl.parentElement;
       if (originalPre.dataset.richRendered) continue;
