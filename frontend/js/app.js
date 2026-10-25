@@ -93,10 +93,22 @@ const MODEL_GROUPS = [
 ];
 
 const ALL_MODELS = MODEL_GROUPS.flatMap(g => g.models);
-const modelById = id => ALL_MODELS.find(m => m.id === id);
+let RUNTIME_MODEL_MAP = {};
+const modelById = id => RUNTIME_MODEL_MAP[id] || ALL_MODELS.find(m => m.id === id);
 const modelName = id => (modelById(id) || {}).name || id;
-const isImageModel = id => (modelById(id) || {}).type === 'image';
-const isNoToolsModel = id => !!(modelById(id) || {}).noTools;
+const isImageModel = id => {
+  const m = modelById(id) || {};
+  return m.type === 'image' || !!(m.capabilities || {}).image_generation;
+};
+const isNoToolsModel = id => {
+  const live = RUNTIME_MODEL_MAP[id];
+  if (live && live.capabilities) return !live.capabilities.tools;
+  const m = (id || '').toLowerCase();
+  if ((modelById(id) || {}).noTools) return true;
+  if (m.startsWith('o1') || m.startsWith('o3') || m.startsWith('o4')) return true;
+  if (m.startsWith('gemini-') && m !== 'gemini-2.5-flash-image') return true;
+  return false;
+};
 
 const TIER_COLORS = { budget: '#1B7F4D', standard: '#B45309', premium: '#6B5CD6', ultra: '#E11900' };
 const TIERS = ['all', 'budget', 'standard', 'premium', 'ultra'];
@@ -139,7 +151,19 @@ function fmtBytes(n) {
 function renderMarkdown(text) {
   try {
     const html = marked.parse(text || '', { breaks: true, gfm: true });
-    return { __html: DOMPurify.sanitize(html, { ADD_ATTR: ['target'] }) };
+    const safe = DOMPurify.sanitize(html, { ADD_ATTR: ['target'] });
+    // Prevent the browser from requesting nonexistent public /images paths.
+    // Images are authenticated workspace assets loaded after Markdown mounts.
+    const template = document.createElement('template');
+    template.innerHTML = safe;
+    for (const img of template.content.querySelectorAll('img[src]')) {
+      const relative = RdiRichContent.workspaceImagePath(img.getAttribute('src'));
+      if (!relative) continue;
+      img.removeAttribute('src');
+      img.setAttribute('data-rdi-workspace-path', relative);
+      img.hidden = true;
+    }
+    return { __html: template.innerHTML };
   } catch (e) {
     return { __html: DOMPurify.sanitize((text || '').replace(/</g, '&lt;')) };
   }
@@ -362,15 +386,23 @@ function ModelPalette({ open, onClose, current, onPick, agentMode }) {
           {groups.map(g => (
             <div key={g.group}>
               <div className="palette-group">{g.group}</div>
-              {g.models.map(m => (
-                <div key={m.id} className={'model-row' + (m.id === current ? ' sel' : '')} onClick={() => onPick(m.id)}>
-                  <span className="model-dot" style={{ background: TIER_COLORS[m.tier] }} />
-                  <span className="model-name">{m.name}</span>
-                  <span className="model-id">{m.id}</span>
-                  {m.noTools && <span className="no-tools-badge" title="No function-calling — can't drive Agent tools">NO TOOLS</span>}
-                  <span className="model-tier" style={{ color: TIER_COLORS[m.tier] }}>{m.tier.toUpperCase()}</span>
-                </div>
-              ))}
+              {g.models.map(m => {
+                const live = modelById(m.id) || m;
+                const unavailable = live.available === false;
+                return (
+                  <div key={m.id}
+                       className={'model-row' + (m.id === current ? ' sel' : '')}
+                       style={unavailable ? { opacity: 0.48, cursor: 'not-allowed' } : null}
+                       onClick={() => { if (!unavailable) onPick(m.id); }}>
+                    <span className="model-dot" style={{ background: TIER_COLORS[live.tier || m.tier] }} />
+                    <span className="model-name">{live.name || m.name}</span>
+                    <span className="model-id">{m.id}</span>
+                    {unavailable && <span className="no-tools-badge" title="Provider is not configured at runtime">OFFLINE</span>}
+                    {!unavailable && isNoToolsModel(m.id) && <span className="no-tools-badge" title="This integration uses a separate tool-capable orchestrator for Agent mode">SPECIALIST</span>}
+                    <span className="model-tier" style={{ color: TIER_COLORS[live.tier || m.tier] }}>{(live.tier || m.tier).toUpperCase()}</span>
+                  </div>
+                );
+              })}
             </div>
           ))}
           {!groups.length && <div style={{ padding: 24, textAlign: 'center' }} className="dim">No models match</div>}
@@ -420,15 +452,92 @@ function RunCard({ run }) {
   );
 }
 
+/* ── User-visible progress (status/tool events, not hidden model reasoning) ── */
+
+function ActivityPanel({ events = [], live = false, run = null }) {
+  const [expanded, setExpanded] = useState(live);
+  const [elapsed, setElapsed] = useState(0);
+  useEffect(() => {
+    if (!live) return;
+    const started = Date.now();
+    const id = setInterval(() => setElapsed(Math.floor((Date.now() - started) / 1000)), 1000);
+    return () => clearInterval(id);
+  }, [live]);
+  if (!live && !events.length && !run) return null;
+  const current = events.length ? events[events.length - 1].action : 'Preparing response…';
+  return (
+    <div className="activity-panel">
+      <button type="button" className="activity-toggle" aria-expanded={expanded}
+              onClick={() => setExpanded(value => !value)}>
+        {live && <span className="activity-pulse" aria-label="In progress" />}
+        <span className="activity-summary">{live ? current : 'View completed activity'}</span>
+        <span className="activity-toggle-hint">{live ? elapsed + 's · ' : ''}{expanded ? 'Hide details' : 'Show details'}</span>
+        <Ic.down />
+      </button>
+      {expanded && (
+        <div className="activity-details" role="status" aria-live="polite">
+          {(events.length ? events : [{ action: 'Preparing response…' }]).map((event, index) => (
+            <div className="activity-entry" key={index}>
+              <span aria-hidden="true">{event.icon || '·'}</span>
+              <span>{event.action}</span>
+            </div>
+          ))}
+          {run && <RunCard run={run} />}
+          {live && <span className="activity-still-running">Working — you can stop this response at any time.</span>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* Workspace images are private; resolve them with authenticated fetch, not
+ * a publicly mounted /images URL or bearer tokens in the URL query. */
+function WorkspaceImage({ image, conversationId }) {
+  const [src, setSrc] = useState(image.content
+    ? `data:${image.type || 'image/png'};base64,${image.content}` : null);
+  const [error, setError] = useState('');
+  useEffect(() => {
+    if (image.content) {
+      setSrc(`data:${image.type || 'image/png'};base64,${image.content}`);
+      return;
+    }
+    if (!image.path || !conversationId) return;
+    let disposed = false;
+    let localUrl;
+    RdiRichContent.fetchWorkspaceImage(image.path, conversationId, Auth.authHeaders())
+      .then(blob => {
+        if (disposed) return;
+        localUrl = URL.createObjectURL(blob);
+        setSrc(localUrl);
+      }).catch(err => { if (!disposed) setError(err.message); });
+    return () => { disposed = true; if (localUrl) URL.revokeObjectURL(localUrl); };
+  }, [image.content, image.path, image.type, conversationId]);
+  if (error) return <span className="rich-error">{image.name}: {error}</span>;
+  return src ? <img src={src} alt={image.name || 'Generated visual'} />
+             : <span className="msg-pending">Loading image…</span>;
+}
+
 /* ── Message ───────────────────────────────────────────────────────────────── */
 
-function Message({ msg, onSpeak, onImageClick, streaming }) {
+function Message({ msg, onSpeak, onImageClick, streaming, conversationId }) {
   const bodyRef = useRef(null);
   useEffect(() => {
-    if (bodyRef.current && window.Prism) {
-      bodyRef.current.querySelectorAll('pre code').forEach(el => { try { Prism.highlightElement(el); } catch (e) {} });
-    }
-  }, [msg.content, streaming]);
+    // Streaming text stays incremental. Parse charts, SVG and workspace images
+    // only when the completed fenced block is stable, avoiding repeated work.
+    if (streaming) return;
+    const root = bodyRef.current;
+    const timer = setTimeout(() => {
+      if (!root) return;
+      RdiRichContent.enhance(root, conversationId, Auth.authHeaders());
+      if (window.Prism) root.querySelectorAll('pre code').forEach(el => {
+        try { Prism.highlightElement(el); } catch (e) {}
+      });
+    }, 0);
+    return () => {
+      clearTimeout(timer);
+      if (root) RdiRichContent.cleanup(root);
+    };
+  }, [msg.content, streaming, conversationId]);
 
   if (msg.role === 'user') {
     return (
@@ -437,14 +546,39 @@ function Message({ msg, onSpeak, onImageClick, streaming }) {
           {(msg.attachments || []).map((a, i) => (
             <span className="msg-att" key={i}><span className="ok-sq">▪</span> {a.name}</span>
           ))}
-          {(msg.attachments || []).length > 0 && <br />}
-          {msg.content}
+          <div className="msg-user-content" dangerouslySetInnerHTML={renderMarkdown(msg.content || '')} />
         </div>
       </div>
     );
   }
 
-  const images = (msg.attachments || []).filter(a => (a.type || '').startsWith('image'));
+  const images = (msg.attachments || []).filter(a => {
+    if (!(a.type || '').startsWith('image')) return false;
+    // A generated image referenced inline by Markdown must not be repeated
+    // as a second standalone asset card in the same response.
+    if (!a.path || !msg.content) return true;
+    return !['](' + a.path + ')', '](/' + a.path + ')',
+             '](workspace/' + a.path + ')', '](/workspace/' + a.path + ')']
+      .some(marker => msg.content.includes(marker));
+  });
+  const resolveImage = async image => {
+    if (image.content) return image;
+    const blob = await RdiRichContent.fetchWorkspaceImage(
+      image.path, conversationId, Auth.authHeaders());
+    const encoded = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onerror = () => reject(new Error('Cannot open generated image'));
+      reader.onload = () => resolve(reader.result.split(',')[1]);
+      reader.readAsDataURL(blob);
+    });
+    return { ...image, content: encoded };
+  };
+  const imageOperation = (image, action) => {
+    resolveImage(image).then(resolved => {
+      if (action === 'copy') return RdiRichContent.copyImage(resolved.content, resolved.type);
+      onImageClick(resolved, action);
+    }).catch(err => alert('Image unavailable: ' + err.message));
+  };
   return (
     <div className="msg-ai">
       <div className="msg-ai-head">
@@ -452,28 +586,46 @@ function Message({ msg, onSpeak, onImageClick, streaming }) {
         <span className="msg-ai-name">RDI AI</span>
         <span className="msg-ai-meta">{msg.meta || ''}</span>
       </div>
-      {msg.run && <RunCard run={msg.run} />}
+      {(streaming || (msg.activity || []).length > 0 || msg.run) &&
+        <ActivityPanel live={!!streaming} events={msg.activity || []} run={msg.run} />}
       {images.length > 0 && (
         <div className={'img-grid ' + (images.length === 1 ? 'g1' : images.length === 2 ? 'g2' : '')} style={{ marginBottom: 14 }}>
           {images.map((a, i) => (
-            <div className="img-cell" key={i} onClick={() => onImageClick(a)}>
-              <img src={`data:image/png;base64,${a.content}`} alt={a.name} />
+            <div className="img-cell" key={i} onClick={() => imageOperation(a)}>
+              <WorkspaceImage image={a} conversationId={conversationId} />
               <div className="img-cell-bar">
                 <span className="lbl">{a.name}</span>
-                <button onClick={e => { e.stopPropagation(); onImageClick(a, 'edit'); }}>edit</button>
-                <button onClick={e => { e.stopPropagation(); onImageClick(a, 'vary'); }}>vary</button>
+                <button onClick={async e => {
+                  e.stopPropagation();
+                  imageOperation(a, 'copy');
+                }}>copy image</button>
+                <button onClick={e => { e.stopPropagation(); imageOperation(a, 'edit'); }}>edit</button>
+                <button onClick={e => { e.stopPropagation(); imageOperation(a, 'vary'); }}>vary</button>
               </div>
             </div>
           ))}
         </div>
       )}
-      <div className="msg-body" ref={bodyRef}>
-        <span dangerouslySetInnerHTML={renderMarkdown(msg.content)} />
-        {streaming && <span className="stream-caret" />}
-      </div>
+      {(msg.content || streaming) && <div className="msg-body" ref={bodyRef}>
+        {msg.content && <div className="msg-markdown" dangerouslySetInnerHTML={renderMarkdown(msg.content)} />}
+        {streaming && !msg.content && <span className="msg-pending">Response in progress…</span>}
+        {streaming && !!msg.content && <span className="stream-caret" aria-hidden="true" />}
+      </div>}
       {!streaming && msg.content && (
         <div className="msg-actions">
-          <button className="txt-btn" onClick={() => navigator.clipboard.writeText(msg.content)}>copy</button>
+          <button className="txt-btn" onClick={async () => {
+            try { await navigator.clipboard.writeText(msg.content); }
+            catch (err) { alert('Text copy unavailable: ' + err.message); }
+          }}>copy text</button>
+          <button className="txt-btn" onClick={async () => {
+            try {
+              if (!navigator.clipboard?.write || !window.ClipboardItem) throw new Error('Rich copy needs HTTPS or localhost');
+              await navigator.clipboard.write([new ClipboardItem({
+                'text/html': new Blob([bodyRef.current?.innerHTML || ''], { type: 'text/html' }),
+                'text/plain': new Blob([msg.content], { type: 'text/plain' }),
+              })]);
+            } catch (err) { alert('Rich copy unavailable: ' + err.message); }
+          }}>copy formatted</button>
           <button className="txt-btn" onClick={() => onSpeak(msg.content)}>speak</button>
         </div>
       )}
@@ -499,6 +651,8 @@ function Composer({ conv, agentMode, model, onOpenModel, onSend, onStop, busy, d
   };
 
   const submit = () => {
+    // Never silently discard a file still uploading or one that failed.
+    if (attachments.some(a => a.status !== 'done')) return;
     const ready = attachments.filter(a => a.status === 'done');
     if ((!text.trim() && !ready.length) || busy || disabled) return;
     onSend(text.trim(), ready);
@@ -514,6 +668,23 @@ function Composer({ conv, agentMode, model, onOpenModel, onSend, onStop, busy, d
   const pickFiles = (e) => {
     [...e.target.files].forEach(f => uploadFile(f));
     e.target.value = '';
+  };
+
+  const onPaste = e => {
+    // Retain normal pasted text. Upload clipboard images/files as attachments.
+    const files = [...(e.clipboardData?.items || [])]
+      .filter(item => item.kind === 'file')
+      .map(item => item.getAsFile())
+      .filter(Boolean);
+    if (!files.length) return;
+    e.preventDefault();
+    files.forEach((file, index) => {
+      const ext = (file.type.split('/')[1] || 'png').replace('jpeg', 'jpg');
+      const needsName = !file.name || file.name === 'image.png' || file.name === 'blob';
+      uploadFile(needsName
+        ? new File([file], `pasted-${Date.now()}-${index}.${ext}`, { type: file.type })
+        : file);
+    });
   };
 
   const toggleRec = async () => {
@@ -571,6 +742,8 @@ function Composer({ conv, agentMode, model, onOpenModel, onSend, onStop, busy, d
               </span>
               <span className="spacer" />
               <button className="btn-allow" onClick={() => onPermission('allow')}>Allow</button>
+              <button className="btn-allow" title={`Always approve ${permission.tool} while this conversation is active`}
+                      onClick={() => onPermission('allow', true)}>Always Allow</button>
               <button className="btn-deny" onClick={() => onPermission('deny')}>Deny</button>
             </div>
             {permission.preview && <div className="perm-code">{permission.preview}</div>}
@@ -587,7 +760,7 @@ function Composer({ conv, agentMode, model, onOpenModel, onSend, onStop, busy, d
           <div className="guard-banner">
             <span className="sq" />
             <span style={{ flex: 1 }}>
-              <strong>{modelName(guard)}</strong> can't drive tools — this agent run stays on <strong>GPT-4.1</strong>. Nothing breaks.
+              <strong>{modelName(guard)}</strong> is a specialist in this integration — Agent mode will use a tool-capable premium orchestrator while keeping specialist capabilities available.
             </span>
             <button className="guard-btn" onClick={onGuardChat}>use it in Chat →</button>
             <button className="guard-btn" onClick={onGuardDismiss}>ok</button>
@@ -599,7 +772,11 @@ function Composer({ conv, agentMode, model, onOpenModel, onSend, onStop, busy, d
               {attachments.map(a => (
                 <span key={a.key} className={'att-chip ' + a.status}>
                   <span className="sq" style={{ background: a.status === 'done' ? 'var(--ok)' : a.status === 'failed' ? 'var(--red)' : 'var(--warn)' }} />
-                  {a.name}{a.status === 'uploading' ? ' — uploading…' : a.status === 'failed' ? ' — upload failed' : ''}
+                  {a.name}
+                  {a.status === 'uploading' ? ' — uploading…' : ''}
+                  {a.status === 'failed' ? ` — ${a.error || 'upload failed'}` : ''}
+                  {a.status === 'done' && a.extraction?.complete === false
+                    ? ` — original saved; ${a.extraction.note || 'text extraction unavailable'}` : ''}
                   {a.status === 'failed' && <button className="att-retry" onClick={() => uploadFile(a.file, a.key)}>retry</button>}
                   <button className="x" onClick={() => setAttachments(list => list.filter(x => x.key !== a.key))}>✕</button>
                 </span>
@@ -607,7 +784,8 @@ function Composer({ conv, agentMode, model, onOpenModel, onSend, onStop, busy, d
             </div>
           )}
           <textarea ref={taRef} rows="1" value={text} placeholder={placeholder}
-                    onChange={e => { setText(e.target.value); grow(); }} onKeyDown={onKey} disabled={disabled} />
+                    onChange={e => { setText(e.target.value); grow(); }} onKeyDown={onKey}
+                    onPaste={onPaste} disabled={disabled} />
           <div className="composer-tools">
             <input ref={fileRef} type="file" multiple style={{ display: 'none' }} onChange={pickFiles} />
             <button className="tool-btn" title="Attach files" onClick={() => fileRef.current.click()}><Ic.clip /></button>
@@ -616,13 +794,14 @@ function Composer({ conv, agentMode, model, onOpenModel, onSend, onStop, busy, d
               {m.name || model}
               <Ic.down />
             </button>
-            {agentMode && !imgMode && <span className="tools-pill">15 tools ready</span>}
+            {agentMode && !imgMode && <span className="tools-pill">tools ready</span>}
             <span className="spacer" />
             <button className={'tool-btn' + (recording ? ' rec' : '')} title="Voice input" onClick={toggleRec}><Ic.mic /></button>
             {busy
               ? <button className="btn-send" title="Stop" onClick={onStop}><Ic.stop /></button>
               : <button className="btn-send" title="Send" onClick={submit}
-                        disabled={disabled || (!text.trim() && !attachments.some(a => a.status === 'done'))}><Ic.send /></button>}
+                        disabled={disabled || attachments.some(a => a.status !== 'done') ||
+                          (!text.trim() && !attachments.some(a => a.status === 'done'))}><Ic.send /></button>}
           </div>
         </div>
         <div className="composer-hints">
@@ -636,7 +815,7 @@ function Composer({ conv, agentMode, model, onOpenModel, onSend, onStop, busy, d
 /* ── Chat / Agent view ─────────────────────────────────────────────────────── */
 
 function ChatView(props) {
-  const { conv, messages, streamText, streamRun, busy, user, agentMode, setAgentMode,
+  const { conv, messages, streamText, streamRun, busy, activity, user, agentMode, setAgentMode,
           onSend, permission, onPermission, model, connState } = props;
   const scrollRef = useRef(null);
   const pinnedRef = useRef(true);
@@ -644,7 +823,7 @@ function ChatView(props) {
   useEffect(() => {
     const el = scrollRef.current;
     if (el && pinnedRef.current) el.scrollTop = el.scrollHeight;
-  }, [messages, streamText, streamRun]);
+  }, [messages, streamText, streamRun, activity, busy]);
 
   const onScroll = () => {
     const el = scrollRef.current; if (!el) return;
@@ -698,10 +877,13 @@ function ChatView(props) {
         <div className="chat-scroll" ref={scrollRef} onScroll={onScroll}>
           <div className="chat-inner">
             {messages.map((m, i) => (
-              <Message key={i} msg={m} onSpeak={speak} onImageClick={props.onImageClick} />
+              <Message key={i} msg={m} conversationId={conv}
+                       onSpeak={speak} onImageClick={props.onImageClick} />
             ))}
-            {(streamText || streamRun) && (
-              <Message msg={{ role: 'assistant', content: streamText, run: streamRun, meta: modelName(model) }}
+            {(busy || streamText || streamRun) && (
+              <Message msg={{ role: 'assistant', content: streamText, run: streamRun,
+                              activity, attachments: props.streamImages, meta: modelName(model) }}
+                       conversationId={conv}
                        onSpeak={speak} onImageClick={props.onImageClick} streaming={busy} />
             )}
           </div>
@@ -1086,6 +1268,8 @@ function App() {
   const [messages, setMessages] = useState([]);
   const [streamText, setStreamText] = useState('');
   const [streamRun, setStreamRun] = useState(null);
+  const [streamImages, setStreamImages] = useState([]);
+  const [activity, setActivity] = useState([]);
   const [busy, setBusy] = useState(false);
   const [model, setModel] = useState(localStorage.getItem('rdi_model') || 'gpt-4.1-global');
   const [modelOpen, setModelOpen] = useState(false);
@@ -1096,6 +1280,7 @@ function App() {
   const [conn, setConn] = useState('connecting');
   const [connAttempt, setConnAttempt] = useState(0);
   const [attachments, setAttachments] = useState([]);
+  const [dragOver, setDragOver] = useState(false);
   const [crossChat, setCrossChat] = useState(false);
   const [wsFiles, setWsFiles] = useState([]);
   const [wsMode, setWsMode] = useState('cloud');
@@ -1106,9 +1291,16 @@ function App() {
   const [toasts, setToasts] = useState([]);
   const [imgModal, setImgModal] = useState(null);
   const [convSearch, setConvSearch] = useState('');
+  const [, setCatalogVersion] = useState(0);
 
   const streamRef = useRef('');
   const runRef = useRef(null);
+  const streamImagesRef = useRef([]);
+  const activityRef = useRef([]);
+  const pendingRequestRef = useRef(null);
+  const uploadControllersRef = useRef(new Map());
+  const loadTargetRef = useRef(null);
+  const busyRef = useRef(false);
   const modelRef = useRef(model);
   const convRef = useRef(convId);
   useEffect(() => { modelRef.current = model; }, [model]);
@@ -1123,6 +1315,26 @@ function App() {
     setTimeout(() => setToasts(ts => ts.filter(t => t.id !== id)), 4200);
   }, []);
 
+  useEffect(() => {
+    if (!authed) return;
+    Auth.fetchJSON('/models/catalog')
+      .then(items => {
+        RUNTIME_MODEL_MAP = {};
+        (items || []).forEach(m => { RUNTIME_MODEL_MAP[m.id] = m; });
+        setCatalogVersion(v => v + 1);
+        const selected = RUNTIME_MODEL_MAP[modelRef.current];
+        if (selected && selected.available === false) {
+          const fallback = (items || []).find(m => m.available && m.capabilities && m.capabilities.tools)
+            || (items || []).find(m => m.available);
+          if (fallback) {
+            setModel(fallback.id);
+            modelRef.current = fallback.id;
+          }
+        }
+      })
+      .catch(() => {});
+  }, [authed]);
+
   /* ── WS wiring ── */
   useEffect(() => {
     if (!authed) return;
@@ -1135,11 +1347,17 @@ function App() {
     });
     RdiWS.on('conversations', d => setConvs(d.conversations || []));
     RdiWS.on('conversation_created', d => {
+      // The creation acknowledgement may arrive after the user clicked New chat.
+      if (!d.request_id || d.request_id !== pendingRequestRef.current) return;
+      convRef.current = d.id;
       setConvId(d.id); setConvTitle(d.conversation.title);
       RdiWS.setActiveConversation(d.id, 0);
-      setConvs(cs => [d.conversation, ...cs]);
+      setConvs(cs => [d.conversation, ...cs.filter(c => c.id !== d.id)]);
     });
     RdiWS.on('conversation_loaded', d => {
+      if (loadTargetRef.current !== d.conversation.id) return;
+      loadTargetRef.current = null;
+      convRef.current = d.conversation.id;
       setConvId(d.conversation.id);
       setConvTitle(d.conversation.title);
       setModel(d.conversation.model || modelRef.current);
@@ -1147,17 +1365,27 @@ function App() {
       setMessages((d.messages || []).map(m => ({
         role: m.role, content: m.content, attachments: m.attachments || [],
       })));
-      setStreamText(''); streamRef.current = '';
-      setStreamRun(d.running && d.last_run ? { steps: d.last_run.steps || [] } : null);
-      runRef.current = null;
-      setBusy(!!d.running);
+      streamRef.current = d.partial_text || '';
+      setStreamText(streamRef.current);
+      streamImagesRef.current = [];
+      setStreamImages([]);
+      activityRef.current = d.activity_log || [];
+      setActivity(activityRef.current);
+      runRef.current = d.running && d.last_run ? { steps: d.last_run.steps || [] } : null;
+      setStreamRun(runRef.current);
+      busyRef.current = !!d.running;
+      setBusy(busyRef.current);
       RdiWS.setActiveConversation(d.conversation.id, d.current_seq || 0);
       RdiWS.send({ type: 'get_artifacts', conversation_id: d.conversation.id });
       RdiWS.send({ type: 'get_workspace' });
     });
     RdiWS.on('conversation_deleted', d => {
       setConvs(cs => cs.filter(c => c.id !== d.id));
-      if (convRef.current === d.id) { setConvId(null); setMessages([]); setStreamText(''); setStreamRun(null); }
+      if (convRef.current === d.id) {
+        convRef.current = null; RdiWS.setActiveConversation(null, 0);
+        setConvId(null); setMessages([]); setStreamText(''); setStreamRun(null);
+        activityRef.current = []; setActivity([]); busyRef.current = false; setBusy(false);
+      }
     });
     RdiWS.on('conversation_renamed', d => {
       setConvs(cs => cs.map(c => c.id === d.id ? { ...c, title: d.title } : c));
@@ -1167,15 +1395,21 @@ function App() {
     RdiWS.on('token', d => {
       streamRef.current += d.text;
       setStreamText(streamRef.current);
+      busyRef.current = true;
       setBusy(true);
     });
     RdiWS.on('done', () => {
       finalizeStream();
+      busyRef.current = false;
+      pendingRequestRef.current = null;
       setBusy(false);
       RdiWS.send({ type: 'list_conversations' });
     });
     RdiWS.on('error', d => {
-      if (streamRef.current) finalizeStream();
+      if (d.request_id && d.request_id !== pendingRequestRef.current) return;
+      if (streamRef.current || runRef.current || streamImagesRef.current.length) finalizeStream();
+      busyRef.current = false;
+      pendingRequestRef.current = null;
       setBusy(false);
       pushToast(d.message || 'Something went wrong', true);
     });
@@ -1185,23 +1419,54 @@ function App() {
       setStreamRun(runRef.current);
     });
     RdiWS.on('run_step', d => {
+      if (d.final && !busyRef.current) return; // cancelled run already finalized
       runRef.current = { ...(runRef.current || {}), run_id: d.run_id, steps: d.steps || [], final: d.final };
       setStreamRun(runRef.current);
       if (d.final) setPermission(null);
     });
     RdiWS.on('model_fallback', d => {
       setFallback(d);
-      pushToast(`${modelName(d.requested)} can't drive tools — run continues on ${modelName(d.fallback)}`);
+      pushToast(`${modelName(d.requested)} is being used as a specialist; orchestration continues on ${modelName(d.fallback)}`);
+    });
+    RdiWS.on('auto_agent_started', d => {
+      pushToast(d.reason || 'Using tools automatically for this request');
     });
     RdiWS.on('permission', d => setPermission(d));
+    RdiWS.on('permission_timeout', d => {
+      setPermission(null);
+      pushToast(d.message || 'Permission expired; tool not executed', true);
+    });
     RdiWS.on('permission_auto', d => pushToast(`auto-approved read-only: ${d.tool}`));
     RdiWS.on('auto_allow_set', d => setAutoAllow(!!d.enabled));
 
+    RdiWS.on('request_rejected', d => pushToast(d.message || 'Request rejected', true));
     RdiWS.on('tool_result', () => {});
-    RdiWS.on('activity', () => {});
-    RdiWS.on('activity_done', () => {});
-    RdiWS.on('workspace', d => { setWsFiles(d.files || []); if (d.workspace_mode) setWsMode(d.workspace_mode); });
-    RdiWS.on('artifacts', d => setArtifacts(d.artifacts || []));
+    RdiWS.on('activity', d => {
+      activityRef.current = [...activityRef.current, { action: d.action || 'Working…', icon: d.icon || '·' }].slice(-16);
+      setActivity(activityRef.current);
+    });
+    RdiWS.on('activity_done', () => {
+      busyRef.current = false;
+      pendingRequestRef.current = null;
+      setBusy(false);
+    });
+    RdiWS.on('cancelled', d => {
+      if (streamRef.current || runRef.current || streamImagesRef.current.length) finalizeStream();
+      busyRef.current = false;
+      pendingRequestRef.current = null;
+      setBusy(false);
+      setPermission(null);
+      pushToast(d.message || 'Run stopped');
+    });
+    RdiWS.on('workspace', d => {
+      const responseConv = d.conversation_id || d.conv_id;
+      if (responseConv && responseConv !== convRef.current) return;
+      setWsFiles(d.files || []); if (d.workspace_mode) setWsMode(d.workspace_mode);
+    });
+    RdiWS.on('artifacts', d => {
+      if (d.conv_id !== convRef.current) return;
+      setArtifacts(d.artifacts || []);
+    });
     RdiWS.on('workspace_settings_updated', d => {
       setWsMode(d.mode); setWsCustomPath(d.custom_path || '');
       pushToast('Workspace settings saved');
@@ -1210,6 +1475,12 @@ function App() {
 
     RdiWS.on('image_result', d => {
       const name = d.filename || `generated_${Date.now()}.png`;
+      if (d.from_agent && d.base64) {
+        streamImagesRef.current = [...streamImagesRef.current,
+          { name, type: 'image/png', path: 'images/' + name, content: d.base64 }];
+        setStreamImages(streamImagesRef.current);
+        return;
+      }
       if (d.base64) {
         setMessages(ms => [...ms, {
           role: 'assistant',
@@ -1227,8 +1498,19 @@ function App() {
     });
 
     RdiWS.on('resume_ok', d => {
+      if (typeof d.snapshot === 'string') {
+        streamRef.current = d.snapshot;
+        setStreamText(d.snapshot);
+        RdiWS.setActiveConversation(convRef.current, d.current_seq || 0);
+      }
+      if (d.reload_required && convRef.current) {
+        // Completed message is in PostgreSQL, not in the finite replay buffer.
+        loadTargetRef.current = convRef.current;
+        RdiWS.setActiveConversation(convRef.current, d.current_seq || 0);
+        RdiWS.send({ type: 'load_conversation', conversation_id: convRef.current });
+      }
       if (d.replayed > 0) pushToast(`Reconnected — resumed stream (${d.replayed} events replayed)`);
-      if (d.running) setBusy(true);
+      if (d.running) { busyRef.current = true; setBusy(true); }
     });
 
     RdiWS.connect((status, attempt) => {
@@ -1247,14 +1529,20 @@ function App() {
   const finalizeStream = () => {
     const text = streamRef.current;
     const run = runRef.current;
-    if (text || run) {
+    if (text || run || streamImagesRef.current.length) {
       setMessages(ms => [...ms, {
-        role: 'assistant', content: text, run,
+        role: 'assistant', content: text, run, activity: activityRef.current,
+        // Image bytes already live in the private workspace. Persist URLs,
+        // not a second copy of multi-megabyte base64 in React history.
+        attachments: streamImagesRef.current.map(({ name, type, path, content }) =>
+          path ? { name, type, path } : { name, type, content }),
         meta: modelName(modelRef.current),
       }]);
     }
     streamRef.current = ''; setStreamText('');
+    streamImagesRef.current = []; setStreamImages([]);
     runRef.current = null; setStreamRun(null);
+    activityRef.current = []; setActivity([]);
     setPermission(null);
   };
 
@@ -1268,14 +1556,42 @@ function App() {
   }, []);
 
   /* ── Actions ── */
-  const newConversation = () => {
+  const resetActiveView = () => {
+    const oldId = convRef.current;
+    const oldRequest = pendingRequestRef.current;
+    if (busyRef.current) {
+      RdiWS.dropPending(oldRequest);
+      RdiWS.send({ type: 'stop', conversation_id: oldId, request_id: oldRequest });
+    }
+    pendingRequestRef.current = null;
+    for (const controller of uploadControllersRef.current.values()) controller.abort();
+    uploadControllersRef.current.clear();
+    setAttachments([]);
+    loadTargetRef.current = null;
+    busyRef.current = false;
+    convRef.current = null;
+    RdiWS.setActiveConversation(null, 0);
     setConvId(null); setConvTitle(''); setMessages([]);
-    setStreamText(''); streamRef.current = '';
-    setStreamRun(null); runRef.current = null;
-    setPermission(null); setView('chat');
+    streamRef.current = ''; setStreamText('');
+    runRef.current = null; setStreamRun(null);
+    streamImagesRef.current = []; setStreamImages([]);
+    activityRef.current = []; setActivity([]);
+    setBusy(false); setPermission(null); setArtifacts([]);
+    setCrossChat(false); setFallback(null);
+  };
+
+  const newConversation = () => {
+    resetActiveView();
+    setView('chat');
   };
 
   const openConv = (id) => {
+    if (id === convRef.current) return;
+    resetActiveView();
+    loadTargetRef.current = id;
+    convRef.current = id;
+    RdiWS.setActiveConversation(id, 0);
+    setConvId(id);
     setView('chat');
     RdiWS.send({ type: 'load_conversation', conversation_id: id });
   };
@@ -1291,7 +1607,7 @@ function App() {
   };
 
   const uploadFile = useCallback((file, existingKey) => {
-    const key = existingKey || `${file.name}-${Date.now()}`;
+    const key = existingKey || `${file.name}-${file.size}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
     setAttachments(list => {
       const rest = list.filter(a => a.key !== key);
       return [...rest, { key, name: file.name, file, status: 'uploading' }];
@@ -1299,35 +1615,107 @@ function App() {
     const form = new FormData();
     form.append('file', file);
     if (convRef.current) form.append('conversation_id', convRef.current);
-    fetch('/files/upload', { method: 'POST', headers: Auth.authHeaders(), body: form })
-      .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
+    const controller = new AbortController();
+    uploadControllersRef.current.set(key, controller);
+    fetch('/files/upload', { method: 'POST', headers: Auth.authHeaders(),
+                             body: form, signal: controller.signal })
+      .then(async response => {
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          throw new Error(typeof payload.detail === 'string'
+            ? payload.detail : `Upload failed (HTTP ${response.status})`);
+        }
+        return payload;
+      })
       .then(d => setAttachments(list => list.map(a => a.key === key
-        ? { ...a, status: 'done', payload: { name: d.filename, type: d.content_type, content: d.content } } : a)))
-      .catch(() => setAttachments(list => list.map(a => a.key === key ? { ...a, status: 'failed' } : a)));
+        ? { ...a, status: 'done', extraction: d.extraction, payload: {
+            id: d.attachment_id || d.id,
+            attachment_id: d.attachment_id || d.id,
+            name: d.filename,
+            type: d.content_type,
+            content_type: d.content_type,
+            size: d.size,
+          } } : a)))
+      .catch(err => {
+        if (err.name !== 'AbortError') {
+          setAttachments(list => list.map(a => a.key === key
+            ? { ...a, status: 'failed', error: err.message } : a));
+        }
+      })
+      .finally(() => uploadControllersRef.current.delete(key));
   }, []);
+
+  useEffect(() => {
+    // Native file-drop works anywhere in the app, not just over the composer.
+    // Prevent the browser from navigating away when dropping a spreadsheet.
+    let depth = 0;
+    const hasFiles = event => Array.from(event.dataTransfer?.types || []).includes('Files');
+    const enter = event => {
+      if (!hasFiles(event)) return;
+      event.preventDefault();
+      depth += 1; setDragOver(true);
+    };
+    const over = event => {
+      if (!hasFiles(event)) return;
+      event.preventDefault();
+      event.dataTransfer.dropEffect = 'copy';
+    };
+    const leave = event => {
+      if (!hasFiles(event)) return;
+      depth = Math.max(0, depth - 1);
+      if (depth === 0) setDragOver(false);
+    };
+    const drop = event => {
+      if (!hasFiles(event)) return;
+      event.preventDefault();
+      depth = 0; setDragOver(false);
+      for (const file of Array.from(event.dataTransfer?.files || [])) {
+        uploadFile(file);
+      }
+    };
+    window.addEventListener('dragenter', enter);
+    window.addEventListener('dragover', over);
+    window.addEventListener('dragleave', leave);
+    window.addEventListener('drop', drop);
+    return () => {
+      window.removeEventListener('dragenter', enter);
+      window.removeEventListener('dragover', over);
+      window.removeEventListener('dragleave', leave);
+      window.removeEventListener('drop', drop);
+    };
+  }, [uploadFile]);
 
   const sendMessage = (text, atts) => {
     const payloadAtts = atts.map(a => a.payload).filter(Boolean);
     const imgMode = isImageModel(model);
+    if (busyRef.current) return;
+    const requestId = 'turn-' + Date.now() + '-' + Math.random().toString(36).slice(2);
+    pendingRequestRef.current = requestId;
     setMessages(ms => [...ms, { role: 'user', content: text, attachments: payloadAtts }]);
+    busyRef.current = true;
     setBusy(true);
     streamRef.current = ''; setStreamText('');
     runRef.current = null; setStreamRun(null);
+    streamImagesRef.current = []; setStreamImages([]);
+    activityRef.current = []; setActivity([]);
     setFallback(null);
     if (imgMode) {
-      RdiWS.send({ type: 'generate_image', prompt: text, model, conversation_id: convId, attachments: payloadAtts });
+      RdiWS.send({ type: 'generate_image', request_id: requestId,
+                   prompt: text, model, conversation_id: convRef.current, attachments: payloadAtts });
     } else {
       RdiWS.send({
-        type: 'chat', message: text, model, conversation_id: convId,
-        agent_mode: agentMode && !imgMode, attachments: payloadAtts,
+        type: 'chat', request_id: requestId, message: text, model, conversation_id: convRef.current,
+        agent_mode: agentMode && !imgMode, auto_agent: true, attachments: payloadAtts,
       });
     }
     if (!RdiWS.isConnected()) pushToast('Offline — message queued, will send on reconnect');
   };
 
-  const decidePermission = (decision) => {
+  const decidePermission = (decision, always = false) => {
     if (!permission) return;
-    RdiWS.send({ type: 'permission', request_id: permission.request_id, decision });
+    RdiWS.send({ type: 'permission', request_id: permission.request_id,
+                 decision, always: !!always });
+    if (always) pushToast(`${permission.tool} auto-approved for this active conversation`);
     setPermission(null);
   };
 
@@ -1345,17 +1733,42 @@ function App() {
 
   const exportConv = (fmt) => {
     if (!convId) return;
+    if (fmt === 'pdf') {
+      // Browser print preserves visible Mermaid SVG, charts, code and tables.
+      // The user chooses Save as PDF; server remains an API fallback.
+      window.print();
+      return;
+    }
     downloadBlob(`/conversations/${convId}/export?format=${fmt}`, `${convTitle || 'conversation'}.${fmt}`);
   };
 
   const imageAction = (img, action) => {
     if (!action) { setImgModal(img); return; }
-    const base = img.name.replace(/\.[a-z]+$/i, '');
     if (action === 'edit') {
-      const change = prompt('Describe the change (regenerates this image in place):');
-      if (change) sendMessage(`Edit image ${img.name}: ${change}`, []);
+      const change = prompt('Describe the image edit:');
+      if (change) {
+        setBusy(true);
+        RdiWS.send({
+          type: 'edit_image',
+          conversation_id: convId,
+          source_name: img.name,
+          image_base64: img.content,
+          prompt: change,
+          model: 'gpt-image-1-global',
+          count: 1,
+        });
+      }
     } else if (action === 'vary') {
-      sendMessage(`Generate 4 variations of ${base}, same subject and palette, different composition`, []);
+      setBusy(true);
+      RdiWS.send({
+        type: 'edit_image',
+        conversation_id: convId,
+        source_name: img.name,
+        image_base64: img.content,
+        prompt: 'Create a faithful variation of this image: preserve the subject, intent and key visual identity while exploring a meaningfully different composition.',
+        model: 'gpt-image-1-global',
+        count: 4,
+      });
     }
     setImgModal(null);
   };
@@ -1372,10 +1785,11 @@ function App() {
       disabled={false}
       onOpenModel={() => setModelOpen(true)}
       onSend={sendMessage}
-      onStop={() => pushToast('Run continues server-side — reload-safe; deny the next permission to halt it')}
+      onStop={() => RdiWS.send({ type: 'stop', conversation_id: convRef.current,
+                                     request_id: pendingRequestRef.current })}
       attachments={attachments} setAttachments={setAttachments} uploadFile={uploadFile}
       guard={guard}
-      onGuardDismiss={() => { setGuard(null); setModel('gpt-4.1-global'); }}
+      onGuardDismiss={() => setGuard(null)}
       onGuardChat={() => { setAgentMode(false); setGuard(null); }}
       permission={permission} onPermission={decidePermission}
       autoAllow={autoAllow} onAutoAllow={setAutoAllowBoth}
@@ -1385,6 +1799,9 @@ function App() {
   return (
     <React.Fragment>
       <div className="red-hairline" />
+      {dragOver && <div className="file-drop-indicator" role="status">
+        Drop files to attach to this conversation
+      </div>}
       <div className="app-frame">
         {/* Ink rail */}
         <div className="rail">
@@ -1465,6 +1882,7 @@ function App() {
                     </button>
                     <button className="chip" onClick={() => exportConv('pdf')}><Ic.dl /> PDF</button>
                     <button className="chip" onClick={() => exportConv('docx')}><Ic.dl /> DOCX</button>
+                    <button className="chip" title="Lossless conversation Markdown source" onClick={() => exportConv('md')}><Ic.dl /> Markdown</button>
                   </React.Fragment>
                 )}
                 {agentMode && (
@@ -1500,7 +1918,8 @@ function App() {
 
               <ChatView
                 conv={convId} messages={messages} streamText={streamText} streamRun={streamRun}
-                busy={busy} user={user} agentMode={agentMode} setAgentMode={setAgentMode}
+                streamImages={streamImages}
+                busy={busy} activity={activity} user={user} agentMode={agentMode} setAgentMode={setAgentMode}
                 model={model} connState={conn}
                 recent={convs} onOpenConv={openConv}
                 onSuggestion={(s) => sendMessage(s, [])}

@@ -22,14 +22,29 @@ const RdiWS = (() => {
   let _activeConv = null;         // conversation id whose stream we track
   let _intentionalClose = false;
   let _pingTimer = null;
+  let _awaitingResume = false;
 
   function on(type, fn) { _handlers[type] = fn; }
 
   function dispatch(data) {
-    // Track stream position for resume
-    if (typeof data.seq === 'number' && data.seq > _lastSeq) _lastSeq = data.seq;
-    const fn = _handlers[data.type] || _handlers['*'];
-    if (fn) fn(data);
+    // Resume completion is transport-level: unblock queued sends even if the
+    // user switched chats while the old resume request was in flight.
+    const resumeFinished = data.type === 'resume_ok' && _awaitingResume;
+    if (resumeFinished) _awaitingResume = false;
+
+    // A socket may carry late events from a previous conversation. Ignore them
+    // BEFORE updating sequence numbers or handing them to React.
+    const relevant = !data.conversation_id || data.conversation_id === _activeConv;
+    if (relevant) {
+      // Ignore duplicate or late replayed tokens after a reconnect/load snapshot.
+      if (typeof data.seq === 'number') {
+        if (data.seq <= _lastSeq) return;
+        _lastSeq = data.seq;
+      }
+      const fn = _handlers[data.type] || _handlers['*'];
+      if (fn) fn(data);
+    }
+    if (resumeFinished) _flushQueue();
   }
 
   function setActiveConversation(cid, startSeq) {
@@ -74,9 +89,12 @@ const RdiWS = (() => {
       // Resume the active stream BEFORE flushing user sends, so replayed
       // events arrive in order ahead of new activity.
       if (wasReconnect && _activeConv) {
+        _awaitingResume = true;
         _rawSend({ type: 'resume', conversation_id: _activeConv, last_seq: _lastSeq });
+      } else {
+        _awaitingResume = false;
+        _flushQueue();
       }
-      _flushQueue();
       // Heartbeat keeps corporate proxies from idling the socket out.
       if (_pingTimer) clearInterval(_pingTimer);
       _pingTimer = setInterval(() => _rawSend({ type: 'ping', ts: Date.now() }), 25000);
@@ -126,6 +144,10 @@ const RdiWS = (() => {
 
   function queuedCount() { return _queue.length; }
 
+  function dropPending(requestId) {
+    if (requestId) _queue = _queue.filter(m => m.request_id !== requestId);
+  }
+
   function disconnect() {
     _intentionalClose = true;
     if (_reconnectTimer) { clearTimeout(_reconnectTimer); _reconnectTimer = null; }
@@ -134,10 +156,11 @@ const RdiWS = (() => {
     _connected = false;
     _queue = [];
     _attempt = 0;
+    _awaitingResume = false;
   }
 
   function isConnected() { return _connected; }
 
   return { on, connect, send, disconnect, isConnected,
-           setActiveConversation, queuedCount };
+           setActiveConversation, queuedCount, dropPending };
 })();

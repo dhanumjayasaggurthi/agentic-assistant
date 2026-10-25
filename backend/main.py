@@ -3,9 +3,11 @@
 Storage: PostgreSQL + pgvector (REQUIRED — see docker-compose.postgres.yml).
 Startup fails fast with a clear message when the database is not configured.
 """
+import asyncio
 import base64
 import io
 import sys
+import uuid
 from pathlib import Path
 
 # Windows UTF-8 fix
@@ -209,95 +211,74 @@ async def upload_file(
     conversation_id: str = Form(None),
     user=Depends(get_current_user),
 ):
+    """Persist the original upload and return a lightweight attachment handle."""
     content_type = file.content_type or "application/octet-stream"
-    raw = await file.read()
-    filename = file.filename or "upload"
+    filename = Path(file.filename or "upload").name
+    aid = str(uuid.uuid4())
 
-    # Convert to text or base64 based on type
-    if content_type.startswith("image/"):
-        content = base64.b64encode(raw).decode()
-        file_type = "image"
-    elif content_type == "application/pdf":
+    rel_path = Path("_uploads") / aid / filename
+    disk_path = _user_ws_base(user) / rel_path
+    disk_path.parent.mkdir(parents=True, exist_ok=True)
+
+    max_bytes = max(1, get_config().max_upload_mb) * 1024 * 1024
+    size_bytes = 0
+    try:
+        with disk_path.open("wb") as out:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                size_bytes += len(chunk)
+                if size_bytes > max_bytes:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"Upload exceeds {get_config().max_upload_mb} MB limit",
+                    )
+                out.write(chunk)
+    except Exception:
         try:
-            import PyPDF2
-            reader = PyPDF2.PdfReader(io.BytesIO(raw))
-            content = "\n".join(
-                page.extract_text() or "" for page in reader.pages
-            )
+            disk_path.unlink(missing_ok=True)
+            disk_path.parent.rmdir()
         except Exception:
-            content = raw.decode("utf-8", errors="replace")
-        file_type = "text"
-    elif "word" in content_type or filename.endswith(".docx"):
-        try:
-            from docx import Document
-            doc = Document(io.BytesIO(raw))
-            content = "\n".join(p.text for p in doc.paragraphs)
-        except Exception:
-            content = raw.decode("utf-8", errors="replace")
-        file_type = "text"
-    elif (
-        content_type in ("application/zip", "application/x-zip-compressed", "application/x-zip")
-        or filename.lower().endswith(".zip")
-    ):
-        import zipfile
-        parts = []
-        try:
-            with zipfile.ZipFile(io.BytesIO(raw)) as zf:
-                names = [n for n in zf.namelist()
-                         if not n.endswith("/") and not n.startswith("__MACOSX") and "/.DS_Store" not in n]
-                # Cap: max 50 files, max 200KB per file, max 1MB total extracted
-                total = 0
-                for name in names[:50]:
-                    try:
-                        # Check the declared uncompressed size BEFORE reading, so a
-                        # zip-bomb entry isn't fully decompressed into memory.
-                        try:
-                            if zf.getinfo(name).file_size > 200_000:
-                                parts.append(f"=== {name} [truncated — file too large] ===")
-                                continue
-                        except KeyError:
-                            pass
-                        data = zf.read(name)
-                        if len(data) > 200_000:
-                            parts.append(f"=== {name} [truncated — file too large] ===")
-                            continue
-                        # Attempt UTF-8 decode; skip binary files silently
-                        try:
-                            text = data.decode("utf-8")
-                        except UnicodeDecodeError:
-                            try:
-                                text = data.decode("latin-1")
-                            except Exception:
-                                parts.append(f"=== {name} [binary — skipped] ===")
-                                continue
-                        parts.append(f"=== {name} ===\n{text}")
-                        total += len(text)
-                        if total > 1_000_000:
-                            parts.append("[ZIP extraction stopped — 1 MB text limit reached]")
-                            break
-                    except Exception as ex:
-                        parts.append(f"=== {name} [error: {ex}] ===")
-        except zipfile.BadZipFile:
-            parts = ["[Invalid ZIP file]"]
-        content = "\n\n".join(parts) if parts else "[Empty ZIP file]"
-        file_type = "text"
-    else:
-        content = raw.decode("utf-8", errors="replace")
-        file_type = "text"
+            pass
+        raise
+
+    # Binary originals are retained unchanged. Full extracted text is a separate
+    # sidecar, never inserted into PostgreSQL TEXT or blindly sent to a model.
+    from .attachment_processing import extract_attachment
+    extraction = await asyncio.to_thread(extract_attachment, disk_path, content_type)
+    import json as _json
+    (disk_path.parent / "manifest.json").write_text(
+        _json.dumps({k: v for k, v in extraction.items() if k != "extracted_path"},
+                    ensure_ascii=False), encoding="utf-8")
+    file_type = "image" if content_type.startswith("image/") else extraction["kind"]
 
     from .database import save_attachment
-    aid = await save_attachment(
-        conversation_id or "", filename, content_type, content
-    )
+    try:
+        await save_attachment(
+            conversation_id or "", filename, content_type, "",
+            user_id=user["id"],
+            storage_path=rel_path.as_posix(),
+            size_bytes=size_bytes, attachment_id=aid,
+        )
+    except Exception:
+        disk_path.unlink(missing_ok=True)
+        (disk_path.parent / "extracted.txt").unlink(missing_ok=True)
+        raise
 
     return {
-        "id": aid,
-        "filename": filename,
-        "type": file_type,
-        "content_type": content_type,
-        "content": content,
-        "size": len(raw),
+        "id": aid, "attachment_id": aid,
+        "filename": filename, "name": filename,
+        "type": file_type, "content_type": content_type,
+        "size": size_bytes,
+        "extraction": {
+            "kind": extraction["kind"],
+            "complete": extraction["complete"],
+            "note": extraction.get("note", ""),
+            "extracted_bytes": extraction.get("extracted_bytes", 0),
+        },
     }
+
 
 
 # ── Workspace file API ────────────────────────────────────────────────────────
@@ -398,6 +379,7 @@ async def delete_workspace_file(
 @app.get("/providers/status")
 async def provider_status(user=Depends(get_current_user)):
     cfg = get_config()
+    from .execution import execution_status
     return {
         "azure_chat": cfg.azure_chat is not None,
         "azure_gpt5": cfg.azure_gpt5 is not None,
@@ -408,7 +390,14 @@ async def provider_status(user=Depends(get_current_user)):
         "vertex": cfg.vertex is not None,
         "vertex_image": cfg.vertex_image is not None,
         "sso": cfg.sso.enabled,
+        "execution": execution_status(),
     }
+
+
+@app.get("/models/catalog")
+async def model_catalog(user=Depends(get_current_user)):
+    from .model_capabilities import runtime_catalog
+    return runtime_catalog(get_config())
 
 
 # ── Workspace settings (Tier 3) ───────────────────────────────────────────────
@@ -505,93 +494,24 @@ async def admin_costs(
 # ── Conversation export ───────────────────────────────────────────────────────
 
 def _strip_md(text: str) -> str:
-    import re
-    text = re.sub(r'```[\s\S]*?```', '[code block]', text)
-    text = re.sub(r'`[^`]+`', lambda m: m.group(0)[1:-1], text)
-    text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
-    text = re.sub(r'[*_~]', '', text)
-    return text.strip()
+    """Legacy helper kept for callers; no content removal is permitted."""
+    return text or ""
 
 
 def _export_pdf(title: str, messages: list) -> io.BytesIO:
-    from fpdf import FPDF
-    from .agents.tools import pdf_safe_text
-    pdf = FPDF()
-    pdf.add_page()
-    pdf.set_margins(20, 20, 20)
-    pdf.set_auto_page_break(auto=True, margin=20)
-
-    # Title
-    pdf.set_font("Helvetica", "B", 16)
-    pdf.cell(0, 10, pdf_safe_text(title[:80]), new_x="LMARGIN", new_y="NEXT", align="C")
-    pdf.ln(4)
-
-    for msg in messages:
-        role = (msg["role"] or "").upper()
-        content = _strip_md(msg.get("content") or "")
-        if not content:
-            continue
-
-        # Role label
-        pdf.set_font("Helvetica", "B", 10)
-        if role == "USER":
-            pdf.set_text_color(120, 70, 40)
-        else:
-            pdf.set_text_color(80, 60, 160)
-        pdf.cell(0, 7, f"[{role}]", new_x="LMARGIN", new_y="NEXT")
-        pdf.set_text_color(30, 25, 20)
-
-        # Content
-        pdf.set_font("Helvetica", size=10)
-        for line in content.split("\n"):
-            safe = pdf_safe_text(line.rstrip())
-            if safe.strip():
-                pdf.multi_cell(0, 6, safe, new_x="LMARGIN", new_y="NEXT")
-            else:
-                pdf.ln(2)
-        pdf.ln(5)
-
-    raw = pdf.output()
-    buf = io.BytesIO(raw)
-    buf.seek(0)
-    return buf
+    from .chat_export import export_pdf
+    return export_pdf(title, messages)
 
 
 def _export_docx(title: str, messages: list) -> io.BytesIO:
-    from docx import Document
-    from docx.shared import Pt, RGBColor
-    doc = Document()
-    doc.add_heading(title[:80], 0)
-
-    for msg in messages:
-        role = (msg["role"] or "").upper()
-        content = _strip_md(msg.get("content") or "")
-        if not content:
-            continue
-
-        # Role heading
-        p = doc.add_paragraph()
-        run = p.add_run(f"[{role}]")
-        run.bold = True
-        if role == "USER":
-            run.font.color.rgb = RGBColor(0x78, 0x46, 0x28)
-        else:
-            run.font.color.rgb = RGBColor(0x50, 0x3C, 0xA0)
-        run.font.size = Pt(10)
-
-        # Content paragraph
-        doc.add_paragraph(content)
-
-    buf = io.BytesIO()
-    doc.save(buf)
-    buf.seek(0)
-    return buf
+    from .chat_export import export_docx
+    return export_docx(title, messages)
 
 
 @app.get("/conversations/{conv_id}/export")
 async def export_conversation(
     conv_id: str,
-    format: str = Query("pdf", regex="^(pdf|docx)$"),
+    format: str = Query("pdf", pattern=r"^(pdf|docx|md)$"),
     user=Depends(get_current_user),
 ):
     conv = await get_conversation(conv_id, user["id"])
@@ -602,20 +522,30 @@ async def export_conversation(
     title = conv.get("title") or "Conversation"
     safe_title = "".join(c for c in title if c.isalnum() or c in " _-")[:40].strip() or "conversation"
 
-    if format == "pdf":
-        buf = _export_pdf(title, msgs)
+    if format == "md":
+        # Lossless, machine-readable export of every message and code fence.
+        parts = [f"# {title}"]
+        for m in msgs:
+            parts.append(f"\n## {(m.get('role') or 'assistant').upper()}\n\n{m.get('content') or ''}")
+        data = "\n".join(parts).encode("utf-8")
         return StreamingResponse(
-            buf,
-            media_type="application/pdf",
-            headers={"Content-Disposition": f'attachment; filename="{safe_title}.pdf"'},
+            io.BytesIO(data), media_type="text/markdown; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="{safe_title}.md"'},
         )
-    else:
-        buf = _export_docx(title, msgs)
-        return StreamingResponse(
-            buf,
-            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            headers={"Content-Disposition": f'attachment; filename="{safe_title}.docx"'},
-        )
+    try:
+        if format == "pdf":
+            buf = await asyncio.to_thread(_export_pdf, title, msgs)
+            mime = "application/pdf"
+        else:
+            buf = await asyncio.to_thread(_export_docx, title, msgs)
+            mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    except Exception as exc:
+        # Never substitute a lossy shortened document on encoding/render failure.
+        raise HTTPException(status_code=422, detail=f"Export could not preserve content: {exc}") from exc
+    return StreamingResponse(
+        buf, media_type=mime,
+        headers={"Content-Disposition": f'attachment; filename="{safe_title}.{format}"'},
+    )
 
 
 # ── WebSocket ─────────────────────────────────────────────────────────────────

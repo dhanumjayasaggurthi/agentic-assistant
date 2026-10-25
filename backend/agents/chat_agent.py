@@ -30,7 +30,17 @@ def _route(model: str) -> str:
 
 _DEFAULT_SYSTEM = (
     "You are RDI AI, an advanced enterprise AI assistant. "
-    "Be helpful, accurate, and concise. Format responses in Markdown."
+    "Be helpful, accurate, and concise. Format responses in Markdown. "
+    "When diagrams are requested, write valid Mermaid in a fenced mermaid block, "
+    "using simple flowchart LR/TD syntax and quoted labels, such as "
+    "A[\"QI-TEST 17K rows\"] --> B[\"DataHub\"]. "
+    "Avoid raw HTML tags in Mermaid labels, and keep node IDs simple. "
+    "For numeric charts, use strict, complete JSON in a fenced chart block: "
+    "{\"type\":\"bar\",\"data\":{\"labels\":[\"DEV\",\"QI-TEST\"],"
+    "\"datasets\":[{\"label\":\"Rows\",\"data\":[40000,17000]}]}}. "
+    "Only use sourced numbers, never invent values. "
+    "Do not refer to generated image paths unless a tool actually produced the file. "
+    "If output length is insufficient, explicitly say that continuation is needed."
 )
 
 
@@ -59,16 +69,33 @@ def _user_content(text: str, attachments: Optional[List[Dict]]):
     return parts
 
 
-def attachments_to_text(attachments: Optional[List[Dict]]) -> str:
-    """Flatten attachments to a plain-text block (for text-only / tool-calling models)."""
+def attachments_to_text(
+    attachments: Optional[List[Dict]],
+    per_file_chars: int = 20_000,
+    total_chars: int = 60_000,
+) -> str:
+    """Flatten attachments for text-only/tool models without exploding context."""
     parts = []
+    used = 0
     for att in attachments or []:
         name = att.get("name", "file")
         if _is_image_attachment(att):
-            parts.append(f"[Attached image: {name}]")
+            piece = f"[Attached image available in workspace: {name}]"
         else:
-            content = att.get("content", "")
-            parts.append(f"--- Attached file: {name} ---\n{content}\n---")
+            content = str(att.get("content", "") or "")
+            if len(content) > per_file_chars:
+                raise ValueError(
+                    f"Attachment {name!r} exceeds the {per_file_chars:,}-character model context limit. "
+                    "The full file is retained; ask to analyze a specific section or split the request."
+                )
+            piece = f"--- Attached file: {name} ---\n{content}\n---"
+        if used + len(piece) > total_chars:
+            raise ValueError(
+                f"Attachment context exceeds {total_chars:,} characters. "
+                "No attachment was silently omitted. Select fewer files or a smaller section."
+            )
+        parts.append(piece)
+        used += len(piece)
     return "\n\n".join(parts)
 
 
@@ -87,10 +114,16 @@ def build_messages(
         if role not in ("user", "assistant"):
             continue
         content = m.get("content", "")
-        # Re-attach prior-turn files so follow-up questions keep their context.
+        # Keep prior attachment awareness without resending historical image
+        # base64 or full documents on every turn. The original behavior caused
+        # context to balloon dramatically after a few multimodal turns.
         hist_atts = m.get("attachments") if role == "user" else None
         if hist_atts:
-            messages.append({"role": role, "content": _user_content(content, hist_atts)})
+            prior = attachments_to_text(hist_atts, per_file_chars=12_000, total_chars=30_000)
+            joined = (content or "")
+            if prior:
+                joined = (joined + "\n\n" + prior).strip()
+            messages.append({"role": role, "content": joined})
         else:
             messages.append({"role": role, "content": content})
 
@@ -131,19 +164,10 @@ async def stream_response(
         yield f"Unknown provider for model: {model}"
 
 
-def trim_history(history: List[Dict], max_chars: int = 400_000) -> List[Dict]:
-    """Sliding window: drop the OLDEST messages first, keeping newest within budget.
+def trim_history(history: List[Dict], max_chars: int = 180_000) -> List[Dict]:
+    """Keep the durable transcript unchanged.
 
-    history holds only user/assistant turns (no system message), so we pop from
-    index 0. Attachment content counts toward the budget too."""
-    def _size(m: Dict) -> int:
-        n = len(str(m.get("content", "")))
-        for att in m.get("attachments") or []:
-            n += len(str(att.get("content", "")))
-        return n
-
-    total = sum(_size(m) for m in history)
-    while total > max_chars and len(history) > 1:
-        removed = history.pop(0)
-        total -= _size(removed)
+    LLM context selection is handled at call time. It must never fail the
+    conversation or mutate stored history merely because a file is large.
+    """
     return history

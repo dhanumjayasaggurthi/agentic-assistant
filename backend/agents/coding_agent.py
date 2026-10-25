@@ -2,87 +2,45 @@
 import asyncio
 import json
 import uuid
-from typing import AsyncGenerator, Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from .tools import TOOL_DEFINITIONS, build_preview, execute_tool
 
-# Coding agent uses GPT-5 Codex or falls back to gpt-4o
-_DEFAULT_CODE_MODEL = "gpt-5.3-codex-global"
-_FALLBACK_MODEL = "gpt-4o-global"
 
-_CODING_SYSTEM = """You are RDI AI Agent — a powerful multi-capability assistant with access to a \
-sandboxed workspace. You can write and execute code, create documents, search the web, and generate images.
+_CODING_SYSTEM = """You are RDI AI Agent, an enterprise-grade action assistant operating in a sandboxed per-conversation workspace.
 
-## Available tools
-- **read_file / write_file / create_file / delete_file / list_files** — manage workspace files
-- **run_bash** — execute shell commands in the workspace directory
-- **run_python** — run Python code and see output
-- **search_files** — grep across workspace files
-- **create_pdf** — generate a PDF document (fpdf2)
-- **create_pptx** — generate a PowerPoint presentation (python-pptx)
-- **create_docx** — generate a Word document (python-docx)
-- **create_excel** — generate an Excel spreadsheet (openpyxl)
-- **web_crawl** — fetch and read text content from a URL
-- **web_search** — search DuckDuckGo and return results
-- **generate_image** — generate an image from a text prompt (saved to workspace/images/); returns the saved path
+Your job is to complete the user's task, not merely describe how it could be done.
 
-## Rules
-1. Always explain what you are about to do before calling a tool.
-2. Read existing files before modifying them.
-3. Show code with syntax highlighting in Markdown fences.
-4. When a task is complete, summarize what was done and list created files.
-5. Never access paths outside the workspace/ directory.
-6. For document creation tasks, use the dedicated create_pdf / create_pptx / create_docx / create_excel tools.
-7. For information you don't know, use web_search first, then web_crawl to get full content.
+## Operating model
+- Use tools when the task requires files, code execution, current web information, image inspection/generation, or artifact creation.
+- For substantial coding/debugging, inspect the relevant files first, then use delegate_code when a specialist second opinion materially improves quality. Apply changes yourself with patch_file/write_file and verify them.
+- Prefer patch_file for precise edits. Do not rewrite large files unless necessary.
+- Use inspect_image when an attached/workspace image must be understood before editing or using it.
+- After changing code, run the narrowest meaningful validation (syntax check, unit test, targeted command) before declaring success.
+- Tool errors are evidence, not success. Diagnose and retry with a corrected approach.
+- Keep progress updates short and factual. Do not expose private chain-of-thought.
+- Never claim a file was created or changed unless a tool result confirms it.
+- For factual comparisons or simple workflows, prefer a valid Mermaid diagram or deterministic numeric chart over costly generated raster images. Use generation tools when the user explicitly asks for image assets.
+- Mermaid nodes with punctuation or spaces must have quoted labels: A["QI-TEST 17K rows"] --> B["DataHub"]. Avoid raw HTML tags.
+- Numeric chart specifications must be strict JSON fenced as chart, with type, data.labels, and numeric data.datasets; do not invent measurements.
+- If a tool generated an image, use its actual workspace-relative path, e.g. ![Description](images/actual-file.png). Do not invent /images URLs or nonexistent filenames.
+- Never access paths outside the active workspace.
 
-## Creating PowerPoint presentations with images (MANDATORY WORKFLOW)
+## Artifact creation
+Use dedicated PDF/PPTX/DOCX/XLSX tools when they fit. For presentations, plan the deck, generate any needed images/charts first, then create the PPTX once with the final assets.
 
-When asked to create a PPTX — especially one that should include visuals, diagrams, charts, or any imagery:
+## Research and verifiability
+For time-sensitive or unknown facts, search first and crawl authoritative results as needed. Distinguish sourced facts from your own synthesis.
+Ground factual claims in exact file line numbers, worksheet names, row counts, PDF page numbers or authoritative web URLs returned by tools. Cite those identifiers in the answer; never fabricate references, values, or file content.
+For uploaded CSV/XLSX, first call file_overview to scan every row deterministically. For long documents/ZIP archives, inspect files through read_file with NEXT_START_LINE, search_files, and targeted tools; do not call a first-page sample a complete review.
+If a source exceeds one model context, retain its original and work through successive bounded tool reads. Tell the user which sections have actually been verified and which remain for continuation.
+Public Bitbucket/repository URLs can be fetched with web tools. If private access is denied, explicitly request an authorized connector or uploaded ZIP; never claim the inaccessible repository was read.
 
-**Step 1 — Plan all slides first.**
-Decide slide titles, bullet points, and which slides need a visual.
-
-**Step 2 — Generate images BEFORE calling create_pptx.**
-For each slide that needs an image, call generate_image. The response will be in the format:
-`Image saved. image_path = images/filename.png`
-Copy the value after `image_path = ` EXACTLY and use it in Step 3. Do not rename, guess, or reconstruct the path — use only what generate_image returned.
-
-**Step 3 — Call create_pptx ONCE with all slides, setting image_path on each slide that has an image.**
-- `layout: "image_full"` — hero/title/impact slides where the image fills the whole slide with a caption
-- `layout: "image_right"` — content slides: bullets on the left, image on the right
-- `layout: "text"` — slides with only text/bullets and no image
-
-Example create_pptx call using the full design system:
-```json
-{
-  "filename": "q4_review.pptx",
-  "title": "Q4 Business Review",
-  "subtitle": "Performance, insights, and the road ahead",
-  "slides": [
-    { "title": "Agenda", "content": ["Results", "Key drivers", "Outlook"], "layout": "two_column" },
-    { "title": "Results", "layout": "section", "content": ["The numbers that defined the quarter"] },
-    { "title": "By the numbers", "layout": "metrics", "content": ["23%|Revenue growth", "1.4M|New users", "18%|Margin", "4.8/5|CSAT"], "notes": "Revenue beat plan by 6 points." },
-    { "title": "Record Growth", "content": ["Revenue up 23% YoY", "Two new markets opened", "Retention at all-time high"], "image_path": "images/revenue_chart.png", "layout": "image_right" },
-    { "title": "What customers told us", "layout": "quote", "content": ["This is the most capable platform we have deployed.", "VP Engineering, Fortune 100 client"] },
-    { "title": "Looking Ahead", "content": ["Expand to EMEA"], "image_path": "images/future_vision.png", "layout": "image_full" }
-  ]
-}
-```
-
-## Presentation quality standards — make decks that look designed, not generic
-- **Structure:** cover → agenda → section dividers between topics → content → a metrics slide → a quote if relevant → closing. Aim for 7–12 slides.
-- **Use the varied layouts deliberately.** Don't make every slide a bullet list:
-  - `section` to open each major topic (divider slide)
-  - `metrics` for KPIs/numbers — pass `"VALUE|LABEL"` items (e.g. `"23%|Revenue growth"`)
-  - `quote` for a customer/expert voice or a key takeaway
-  - `two_column` for agendas or comparisons
-  - `image_right` for data/analysis, `image_full` for impact/opening/closing
-- **Content:** 3–5 tight bullets per slide, phrases not paragraphs. Add `notes` (speaker notes) with the detail that would otherwise clutter the slide.
-- **Visuals:** generate specific, high-quality images (`generate_image`) with an explicit style ("clean white background, flat vector infographic, professional"). For real data, produce an actual chart with run_python (matplotlib) saved to images/, then reference that path.
-- **NEVER** ship a deck that is only text slides when visuals or metrics would add value.
+## Completion
+Finish with a concise summary of what changed, validations run, and the exact files/artifacts produced.
 """
 
-MAX_TURNS = 20
+MAX_TURNS = 30
 
 
 async def run_coding_agent(
@@ -103,46 +61,73 @@ async def run_coding_agent(
     Streams tokens via token_callback as they arrive.
     Returns final assistant text.
     """
-    # Build message list for the coding agent
-    from .chat_agent import attachments_to_text
+    # Recent context fits one model call; complete historical text and uploaded
+    # originals are retained in the workspace for read_file pagination.
+    # Never embed megabytes of extracted file content into the prompt.
+    from .chat_agent import _route
     messages = [{"role": "system", "content": _CODING_SYSTEM}]
-    for m in history[-20:]:  # last 20 turns for context
-        if m.get("role") in ("user", "assistant"):
-            content = m["content"]
-            # Re-inject prior-turn attachment text so follow-ups keep file context.
-            atts = m.get("attachments") if m["role"] == "user" else None
-            if atts:
-                content = attachments_to_text(atts) + "\n\n" + (content or "")
-            messages.append({"role": m["role"], "content": content})
+    budget = 110_000
+    used = 0
+    selected = []
+    excluded = 0
+    for item in reversed(history):
+        if item.get("role") not in ("user", "assistant"):
+            continue
+        content = str(item.get("content") or "")
+        attachments = item.get("attachments") or []
+        if attachments:
+            references = ", ".join(
+                str(a.get("name") or "attachment") for a in attachments if isinstance(a, dict)
+            )
+            content += f"\n[Earlier attachment references: {references}; full files in workspace/uploads]"
+        if used + len(content) > budget:
+            excluded += 1
+            continue
+        selected.append({"role": item["role"], "content": content})
+        used += len(content)
+    if excluded:
+        messages.append({
+            "role": "system",
+            "content": (
+                f"{excluded} older conversation turns are outside the active model context. "
+                "Their exact text is retained in uploads/_conversation_history.txt. "
+                "Use read_file with line ranges for earlier details. Do not claim "
+                "to have read omitted turns unless you actually retrieve them."
+            ),
+        })
+    messages.extend(reversed(selected))
+    if len(user_message) > budget:
+        raise ValueError(
+            "User prompt alone exceeds one model context call. Attach the text "
+            "as a file for paginated analysis; the original message remains saved."
+        )
     messages.append({"role": "user", "content": user_message})
 
-    # Route model to correct provider
-    from .chat_agent import _route
     provider = _route(model)
-
-    # Codex models don't support tool calling — switch to the fallback chat model
-    from ..providers.azure_gpt5 import is_codex
-    if is_codex(model):
-        model = _FALLBACK_MODEL
-        provider = _route(model)
 
     # Standard agentic loop
     final_answer = ""
     for turn in range(MAX_TURNS):
-        resp = await _complete_with_tools(messages, model, provider)
+        resp = await _complete_with_tools(
+            messages, model, provider, token_callback=token_callback
+        )
         content = resp.get("content", "")
         tool_calls = resp.get("tool_calls") or []
         finish = resp.get("finish_reason", "stop")
 
-        # Stream any text content — in small chunks, not per-character (the
-        # underlying completion is non-streaming, so per-char just floods WS frames).
+        # Azure planning/final turns stream directly. Other providers still
+        # return complete text, which we emit in bounded chunks.
         if content:
-            _chunk = 48
-            for i in range(0, len(content), _chunk):
-                await token_callback(content[i:i + _chunk])
-                await asyncio.sleep(0)  # yield event loop
+            if not resp.get("streamed"):
+                _chunk = 48
+                for i in range(0, len(content), _chunk):
+                    await token_callback(content[i:i + _chunk])
+                    await asyncio.sleep(0)
             final_answer = content
 
+        if finish in ("length", "max_tokens", "model_context_window_exceeded"):
+            await token_callback("\n\n**Model output limit reached. Reply 'continue' for the remainder.**")
+            break
         if finish == "stop" or not tool_calls:
             break
 
@@ -177,12 +162,29 @@ async def run_coding_agent(
 
             await tool_result_callback(request_id, tool_name, result, allowed)
 
+            # Keep the full result in the UI, but bound what is fed back to the
+            # model. Huge command/file outputs were a major source of context blow-ups.
+            model_result = result
+            if len(model_result) > 20_000:
+                model_result = (
+                    model_result[:16_000]
+                    + "\n...[tool output truncated for model context]...\n"
+                    + model_result[-3_000:]
+                )
             messages.append({
                 "role": "tool",
                 "tool_call_id": tid,
-                "content": result,
+                "content": model_result,
             })
 
+    else:
+        notice = (
+            "\n\n**Analysis paused at the per-run tool-step limit. "
+            "No source files were deleted. Reply 'continue' to resume from the "
+            "saved workspace and inspect remaining sections.**"
+        )
+        await token_callback(notice)
+        final_answer += notice
     return final_answer
 
 
@@ -210,43 +212,113 @@ def _normalize_tool_call(tc):
     return tid, fn.name, args, raw
 
 
-async def _complete_with_tools(messages: List[Dict], model: str, provider: str) -> dict:
+async def _stream_openai_with_tools(client, kwargs: Dict,
+                                    token_callback: Callable[[str], asyncio.Future]) -> dict:
+    """Stream assistant text while accumulating function-call deltas."""
+    kwargs = dict(kwargs)
+    kwargs["stream"] = True
+    stream = await client.chat.completions.create(**kwargs)
+    content_parts: List[str] = []
+    tool_parts: Dict[int, Dict] = {}
+    finish_reason = "stop"
+
+    async for chunk in stream:
+        if not chunk.choices:
+            continue
+        choice = chunk.choices[0]
+        delta = choice.delta
+        if delta.content:
+            content_parts.append(delta.content)
+            await token_callback(delta.content)
+        for tc in (getattr(delta, "tool_calls", None) or []):
+            idx = getattr(tc, "index", 0) or 0
+            entry = tool_parts.setdefault(idx, {"id": "", "name": "", "arguments": ""})
+            if getattr(tc, "id", None):
+                entry["id"] = tc.id
+            fn = getattr(tc, "function", None)
+            if fn is not None:
+                if getattr(fn, "name", None):
+                    entry["name"] += fn.name
+                if getattr(fn, "arguments", None):
+                    entry["arguments"] += fn.arguments
+        if choice.finish_reason:
+            finish_reason = choice.finish_reason
+
+    tool_calls = []
+    for idx in sorted(tool_parts):
+        part = tool_parts[idx]
+        try:
+            args = json.loads(part["arguments"] or "{}")
+        except Exception:
+            args = {}
+        tool_calls.append({
+            "id": part["id"] or str(uuid.uuid4()),
+            "name": part["name"],
+            "input": args,
+        })
+
+    return {
+        "content": "".join(content_parts),
+        "tool_calls": tool_calls or None,
+        "finish_reason": finish_reason,
+        "streamed": True,
+    }
+
+
+async def _complete_with_tools(messages: List[Dict], model: str, provider: str,
+                               token_callback=None) -> dict:
     if provider == "azure_chat":
+        from ..providers.azure_chat import _client
+        client = _client()
+        kwargs = {
+            "model": model,
+            "messages": messages,
+            "tools": TOOL_DEFINITIONS,
+            "tool_choice": "auto",
+            "max_tokens": 8192,
+        }
+        if token_callback:
+            return await _stream_openai_with_tools(client, kwargs, token_callback)
         from ..providers.azure_chat import complete_with_tools
-        return await complete_with_tools(messages, model, TOOL_DEFINITIONS)
+        return await complete_with_tools(messages, model, TOOL_DEFINITIONS, max_tokens=8192)
+
     elif provider == "gpt5":
-        # GPT-5 chat models support tool calling
         from openai import AsyncAzureOpenAI
         from ..config import get_config
         cfg = get_config().azure_gpt5
         if not cfg:
             raise RuntimeError("Azure GPT-5 not configured")
-        c = AsyncAzureOpenAI(
+        client = AsyncAzureOpenAI(
             api_key=cfg.api_key,
             azure_endpoint=cfg.endpoint,
             api_version=cfg.api_version,
         )
-        resp = await c.chat.completions.create(
-            model=model,
-            messages=messages,
-            tools=TOOL_DEFINITIONS,
-            tool_choice="auto",
-            max_completion_tokens=4096,
-        )
+        kwargs = {
+            "model": model,
+            "messages": messages,
+            "tools": TOOL_DEFINITIONS,
+            "tool_choice": "auto",
+            "max_completion_tokens": 8192,
+        }
+        if token_callback:
+            return await _stream_openai_with_tools(client, kwargs, token_callback)
+        resp = await client.chat.completions.create(**kwargs)
         choice = resp.choices[0]
         return {
             "content": choice.message.content or "",
             "tool_calls": choice.message.tool_calls,
             "finish_reason": choice.finish_reason,
         }
+
     elif provider == "bedrock":
         from ..providers.bedrock import complete_bedrock
         sys_msg = next((m["content"] for m in messages if m.get("role") == "system"), None)
         user_msgs = [m for m in messages if m.get("role") != "system"]
-        return await complete_bedrock(user_msgs, model, system_prompt=sys_msg,
-                                      tools=TOOL_DEFINITIONS)
+        return await complete_bedrock(
+            user_msgs, model, system_prompt=sys_msg, tools=TOOL_DEFINITIONS
+        )
+
     else:
-        # Vertex doesn't support tool calling on RDI gateway — fallback to plain completion
         from ..providers.vertex import complete_vertex
         return await complete_vertex(messages, model)
 

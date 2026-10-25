@@ -1,0 +1,53 @@
+name: ChatGPT parity checks
+
+on:
+  push:
+    branches:
+      - "feature/chatgpt-parity-*"
+  pull_request:
+    branches:
+      - feature_review
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install test/runtime dependencies
+        run: pip install -r requirements.txt
+
+      - name: Compile backend
+        run: python -m compileall -q backend
+
+      - name: Model capability unit tests
+        run: python -m unittest -v tests.test_model_capabilities tests.test_phase2_architecture tests.test_user_journeys
+
+      - name: Check WebSocket client syntax
+        run: node --check frontend/js/ws.js
+
+      - name: Assert true image edit wiring
+        run: |
+          grep -q "type: 'edit_image'" frontend/js/app.js
+          grep -q 'elif t == "edit_image"' backend/ws_handler.py
+          grep -q 'await edit_image(' backend/ws_handler.py
+
+      - name: Assert targeted code-edit tools
+        run: |
+          grep -q '"name": "patch_file"' backend/agents/tools.py
+          grep -q '"name": "inspect_image"' backend/agents/tools.py
+          grep -q '"name": "delegate_code"' backend/agents/tools.py
+
+      - name: Assert phase two architecture
+        run: |
+          grep -q 'RDI_EXECUTION_MODE' backend/execution.py
+          grep -q '@app.get("/models/catalog")' backend/main.py
+          grep -q 'attachment_id' frontend/js/app.js
+          grep -q 'get_attachment' backend/ws_handler.py
+          grep -q 'agent_model_route' backend/ws_handler.py

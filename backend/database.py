@@ -144,11 +144,14 @@ CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages (conversation_id, creat
 
 CREATE TABLE IF NOT EXISTS attachments (
     id              TEXT PRIMARY KEY,
+    user_id         TEXT,
     conversation_id TEXT,
     message_id      TEXT,
     filename        TEXT NOT NULL,
     content_type    TEXT NOT NULL,
     content         TEXT NOT NULL,
+    storage_path    TEXT,
+    size_bytes      BIGINT DEFAULT 0,
     created_at      TEXT NOT NULL
 );
 
@@ -202,6 +205,10 @@ CREATE INDEX IF NOT EXISTS idx_artifacts_conv ON artifacts (conversation_id, cre
 _MIGRATIONS = [
     "ALTER TABLE messages ADD COLUMN IF NOT EXISTS attachments TEXT",
     "ALTER TABLE runs ADD COLUMN IF NOT EXISTS fallback_model TEXT",
+    "ALTER TABLE attachments ADD COLUMN IF NOT EXISTS user_id TEXT",
+    "ALTER TABLE attachments ADD COLUMN IF NOT EXISTS storage_path TEXT",
+    "ALTER TABLE attachments ADD COLUMN IF NOT EXISTS size_bytes BIGINT DEFAULT 0",
+    "CREATE INDEX IF NOT EXISTS idx_attachments_user ON attachments (user_id, created_at DESC)",
 ]
 
 _VECTOR_SCHEMA = """
@@ -258,10 +265,7 @@ async def init_db() -> None:
     async with _pg_pool.acquire() as conn:
         await conn.execute(_SCHEMA)
         for sql in _MIGRATIONS:
-            try:
-                await conn.execute(sql)
-            except Exception:
-                pass
+            await conn.execute(sql)
         # pgvector is expected. Degrade visibly (vector_available()) if absent.
         try:
             await conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
@@ -460,15 +464,60 @@ async def get_other_conversation_summaries(user_id: str, exclude_conv_id: str) -
 # ── Attachments ───────────────────────────────────────────────────────────────
 
 async def save_attachment(conv_id: str, filename: str, content_type: str,
-                          content: str, msg_id: str = None) -> str:
-    aid, now = str(uuid.uuid4()), _now()
+                          content: str, msg_id: str = None, user_id: str = None,
+                          storage_path: str = None, size_bytes: int = 0,
+                          attachment_id: str = None) -> str:
+    aid, now = attachment_id or str(uuid.uuid4()), _now()
+    # PostgreSQL TEXT cannot contain NUL (U+0000). The binary original is
+    # stored separately; legacy callers may supply actual extracted text.
+    if not isinstance(content, str):
+        raise TypeError("Attachment content must be Unicode text; store binary on disk")
+    content = content.replace("\x00", "\ufffd")
     async with _pool().acquire() as conn:
         await conn.execute(
-            "INSERT INTO attachments (id,conversation_id,message_id,filename,"
-            "content_type,content,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7)",
-            aid, conv_id, msg_id, filename, content_type, content, now,
+            "INSERT INTO attachments (id,user_id,conversation_id,message_id,filename,"
+            "content_type,content,storage_path,size_bytes,created_at) "
+            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
+            aid, user_id, conv_id, msg_id, filename, content_type, content,
+            storage_path, int(size_bytes or 0), now,
         )
     return aid
+
+
+async def get_attachment(attachment_id: str, user_id: str) -> Optional[Dict]:
+    """Return an attachment only when it belongs to the requesting user.
+
+    Legacy rows without user_id are accepted only when their conversation is
+    owned by the user.
+    """
+    async with _pool().acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT a.*
+            FROM attachments a
+            LEFT JOIN conversations c ON c.id=a.conversation_id
+            WHERE a.id=$1 AND (a.user_id=$2 OR (a.user_id IS NULL AND c.user_id=$2))
+            LIMIT 1
+            """,
+            attachment_id, user_id,
+        )
+        return _row(row)
+
+
+async def bind_attachments_to_conversation(attachment_ids: List[str], conv_id: str,
+                                           user_id: str) -> None:
+    if not attachment_ids:
+        return
+    async with _pool().acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE attachments
+            SET conversation_id=$1
+            WHERE id = ANY($2::text[]) AND user_id=$3
+              AND (conversation_id IS NULL OR conversation_id='' OR conversation_id=$1)
+            """,
+            conv_id, attachment_ids, user_id,
+        )
 
 
 async def get_attachments(conv_id: str) -> List[Dict]:

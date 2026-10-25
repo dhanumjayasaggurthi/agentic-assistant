@@ -2,8 +2,7 @@
 import asyncio
 import contextvars
 import difflib
-import subprocess
-import sys
+import json
 import urllib.parse
 import urllib.request
 from html.parser import HTMLParser
@@ -11,6 +10,7 @@ from pathlib import Path
 from typing import Dict, List
 
 from ..config import get_config
+from ..execution import run_python as execute_python_code, run_shell
 
 # ── Per-request workspace contextvar (set per user in ws_handler) ─────────────
 
@@ -48,6 +48,24 @@ TOOL_DEFINITIONS: List[Dict] = [
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "Relative path within workspace/"},
+                    "start_line": {"type": "integer", "description": "Optional 1-based start line"},
+                    "end_line": {"type": "integer", "description": "Optional 1-based end line"},
+                    "start_char": {"type": "integer", "description": "Optional offset within start_line for rows longer than one response", "default": 0},
+                    "max_chars": {"type": "integer", "description": "Maximum characters to return", "default": 12000},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "file_overview",
+            "description": "Scan the ENTIRE CSV/TSV or XLSX file for grounded row counts, columns, missing values and examples. Read-only; no 20k context limit.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Workspace-relative original CSV/TSV/XLSX path"}
                 },
                 "required": ["path"],
             },
@@ -166,6 +184,53 @@ TOOL_DEFINITIONS: List[Dict] = [
                 "required": ["pattern"],
             },
         },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "patch_file",
+            "description": "Make a precise text replacement in an existing workspace file. Prefer this over rewriting an entire file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "old_text": {"type": "string", "description": "Exact text to replace"},
+                    "new_text": {"type": "string", "description": "Replacement text"},
+                    "occurrence": {"type": "integer", "description": "1-based occurrence when old_text appears multiple times", "default": 1}
+                },
+                "required": ["path", "old_text", "new_text"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "inspect_image",
+            "description": "Inspect an image already in the workspace with a vision-capable premium model.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Workspace-relative image path"},
+                    "question": {"type": "string", "description": "What to analyze in the image", "default": "Describe the image accurately and identify details relevant to the current task."}
+                },
+                "required": ["path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delegate_code",
+            "description": "Ask the premium Codex code specialist for implementation or debugging help. Use for substantial coding tasks, then apply and verify the result with workspace tools.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task": {"type": "string", "description": "Precise coding task or debugging question"},
+                    "context": {"type": "string", "description": "Relevant code/context already gathered", "default": ""}
+                },
+                "required": ["task"]
+            }
+        }
     },
     # ── Document creation ──────────────────────────────────────────────────────
     {
@@ -365,6 +430,12 @@ def build_preview(tool: str, args: Dict) -> str:
             return compute_diff(old, content, path)
         preview = content[:500] + ("…" if len(content) > 500 else "")
         return f"Create {path}:\n{preview}"
+    if tool == "patch_file":
+        return f"Patch workspace/{args.get('path', '')}: replace {len(args.get('old_text', ''))} chars with {len(args.get('new_text', ''))} chars"
+    if tool == "inspect_image":
+        return f"Inspect image workspace/{args.get('path', '')}: {args.get('question', '')[:120]}"
+    if tool == "delegate_code":
+        return f"Delegate to code specialist: {args.get('task', '')[:160]}"
     if tool == "delete_file":
         return f"Delete workspace/{args.get('path', '')}"
     if tool == "list_files":
@@ -398,6 +469,7 @@ def build_preview(tool: str, args: Dict) -> str:
 async def execute_tool(tool: str, args: Dict, image_fn=None) -> str:
     try:
         if tool == "read_file":       return await _read_file(args)
+        if tool == "file_overview":   return await asyncio.to_thread(_file_overview, args)
         if tool == "write_file":      return await _write_file(args)
         if tool == "create_file":     return await _create_file(args)
         if tool == "delete_file":     return await _delete_file(args)
@@ -405,6 +477,9 @@ async def execute_tool(tool: str, args: Dict, image_fn=None) -> str:
         if tool == "run_bash":        return await _run_bash(args)
         if tool == "run_python":      return await _run_python(args)
         if tool == "search_files":    return await _search_files(args)
+        if tool == "patch_file":      return await _patch_file(args)
+        if tool == "inspect_image":   return await _inspect_image(args)
+        if tool == "delegate_code":   return await _delegate_code(args)
         if tool == "create_pdf":      return await _create_pdf(args)
         if tool == "create_pptx":     return await _create_pptx(args)
         if tool == "create_docx":     return await _create_docx(args)
@@ -421,9 +496,105 @@ async def execute_tool(tool: str, args: Dict, image_fn=None) -> str:
 
 async def _read_file(args: Dict) -> str:
     path = _safe_path(args["path"])
-    if not path.exists():
+    if not path.is_file():
         return f"File not found: {args['path']}"
-    return path.read_text(encoding="utf-8", errors="replace")
+    start = max(1, int(args.get("start_line") or 1))
+    stop = max(start, int(args.get("end_line") or start + 199))
+    offset = max(0, int(args.get("start_char") or 0))
+    max_chars = max(1000, min(int(args.get("max_chars") or 12000), 18000))
+    selected = []
+    count = 0
+    last = start - 1
+    next_line = None
+    with path.open("r", encoding="utf-8", errors="replace") as source:
+        for number, line in enumerate(source, 1):
+            if number < start:
+                continue
+            if number > stop:
+                next_line = number
+                break
+            original_line = line.removesuffix("\n").removesuffix("\r")
+            current_offset = offset if number == start else 0
+            if current_offset > len(original_line):
+                return f"Invalid start_char for line {number}: line has {len(original_line)} characters."
+            remaining = max_chars - count - len(f"[{number}] ")
+            if remaining <= 0:
+                next_line = number
+                break
+            portion = original_line[current_offset:]
+            if len(portion) > remaining:
+                if not selected:
+                    # One exceptionally long row: use char offsets without
+                    # losing any part of the actual source line.
+                    chunk = portion[:remaining]
+                    return (f"Source: {args['path']} line {number}, chars "
+                            f"{current_offset}-{current_offset + len(chunk) - 1}.\n"
+                            f"[{number}] {chunk}\n"
+                            f"NEXT_START_LINE={number} NEXT_START_CHAR={current_offset + len(chunk)}")
+                next_line = number
+                break
+            selected.append(f"[{number}] {portion}")
+            count += len(portion) + len(f"[{number}] ") + 1
+            last = number
+    suffix = (f" NEXT_START_LINE={next_line} NEXT_START_CHAR=0"
+              if next_line else " END_OF_FILE")
+    return f"Source: {args['path']} lines {start}-{last}.\n" + "\n".join(selected) + "\n" + suffix
+
+
+def _file_overview(args: Dict) -> str:
+    """Deterministic complete scan; bounded metadata memory, never invent data."""
+    import csv
+    path = _safe_path(args["path"])
+    if not path.is_file():
+        return f"File not found: {args['path']}"
+    suffix = path.suffix.lower()
+    reports = []
+    if suffix in (".csv", ".tsv"):
+        from ..attachment_processing import _text_encoding
+        stream = path.open("r", encoding=_text_encoding(path), errors="replace", newline="")
+        with stream as file:
+            reader = csv.reader(file, delimiter="\t" if suffix == ".tsv" else ",")
+            header = next(reader, [])
+            total = 0
+            missing = [0] * len(header)
+            samples = []
+            for row in reader:
+                total += 1
+                for i in range(len(header)):
+                    if i >= len(row) or not row[i].strip():
+                        missing[i] += 1
+                if len(samples) < 3:
+                    samples.append({"source_row": total + 1, "values": row[:30]})
+            reports.append({"sheet": None, "rows": total, "columns": header,
+                            "missing_by_column": dict(zip(header, missing)),
+                            "first_three_rows": samples, "scan": "complete"})
+    elif suffix in (".xlsx", ".xlsm"):
+        from openpyxl import load_workbook
+        wb = load_workbook(path, read_only=True, data_only=True, keep_links=False)
+        try:
+            for sheet in wb:
+                rows = sheet.iter_rows(values_only=True)
+                header = [str(x) if x is not None else "" for x in (next(rows, ()))]
+                missing = [0] * len(header)
+                total = 0
+                samples = []
+                for row in rows:
+                    total += 1
+                    for i in range(len(header)):
+                        if i >= len(row) or row[i] is None or str(row[i]) == "":
+                            missing[i] += 1
+                    if len(samples) < 3:
+                        samples.append({"source_row": total + 1,
+                                        "values": [str(v) if v is not None else "" for v in row[:30]]})
+                reports.append({"sheet": sheet.title, "rows": total, "columns": header,
+                                "missing_by_column": dict(zip(header, missing)),
+                                "first_three_rows": samples, "scan": "complete"})
+        finally:
+            wb.close()
+    else:
+        return "file_overview supports CSV, TSV and XLSX only. Use extracted text and read_file for other formats."
+    return json.dumps({"source": args["path"], "reports": reports},
+                      ensure_ascii=False, default=str)
 
 
 async def _write_file(args: Dict) -> str:
@@ -440,6 +611,89 @@ async def _create_file(args: Dict) -> str:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(args["content"], encoding="utf-8")
     return f"Created {args['path']}"
+
+
+async def _patch_file(args: Dict) -> str:
+    path = _safe_path(args["path"])
+    if not path.exists():
+        return f"File not found: {args['path']}"
+    old = args.get("old_text", "")
+    new = args.get("new_text", "")
+    if not old:
+        return "Error: old_text must not be empty"
+    text = path.read_text(encoding="utf-8", errors="replace")
+    matches = []
+    start = 0
+    while True:
+        idx = text.find(old, start)
+        if idx < 0:
+            break
+        matches.append(idx)
+        start = idx + max(1, len(old))
+    if not matches:
+        return "Error: exact old_text was not found; read the relevant range and retry with exact text"
+    occurrence = int(args.get("occurrence") or 1)
+    if occurrence < 1 or occurrence > len(matches):
+        return f"Error: occurrence must be between 1 and {len(matches)}"
+    idx = matches[occurrence - 1]
+    updated = text[:idx] + new + text[idx + len(old):]
+    path.write_text(updated, encoding="utf-8")
+    return (
+        f"Patched {args['path']} occurrence {occurrence}/{len(matches)} "
+        f"({len(old)} chars -> {len(new)} chars)"
+    )
+
+
+async def _inspect_image(args: Dict) -> str:
+    import base64 as _b64
+    import mimetypes
+    path = _safe_path(args["path"])
+    if not path.exists():
+        return f"File not found: {args['path']}"
+    mime = mimetypes.guess_type(path.name)[0] or "image/png"
+    if not mime.startswith("image/"):
+        return f"Error: {args['path']} is not an image"
+    b64 = _b64.b64encode(path.read_bytes()).decode()
+    question = args.get("question") or "Describe the image accurately."
+    messages = [{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": question},
+            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
+        ],
+    }]
+    cfg = get_config()
+    chunks = []
+    if cfg.azure_chat:
+        from ..providers.azure_chat import stream_chat
+        async for token in stream_chat(messages, "gpt-4.1-global", max_tokens=4000):
+            chunks.append(token)
+    elif cfg.azure_gpt5:
+        from ..providers.azure_gpt5 import stream_gpt5
+        async for token in stream_gpt5(messages, "gpt-5-global", max_tokens=4000):
+            chunks.append(token)
+    else:
+        return "Error: no vision-capable Azure chat/GPT-5 gateway is configured"
+    return "".join(chunks)
+
+
+async def _delegate_code(args: Dict) -> str:
+    from ..config import get_config
+    cfg = get_config()
+    if not cfg.azure_gpt5:
+        return "Error: GPT-5/Codex gateway is not configured"
+    task = args.get("task", "").strip()
+    context = args.get("context", "")
+    prompt = (
+        "You are a code specialist working inside a larger agent. "
+        "Return implementation-ready guidance or code. Be explicit about assumptions, "
+        "edge cases, and validation. Do not claim files were changed.\n\n"
+        f"TASK:\n{task}\n\n"
+    )
+    if context:
+        prompt += f"CONTEXT:\n{context[:60000]}"
+    from ..providers.azure_gpt5 import codex_responses_api
+    return await codex_responses_api("gpt-5.3-codex-global", prompt, max_output_tokens=8000)
 
 
 async def _delete_file(args: Dict) -> str:
@@ -465,43 +719,31 @@ async def _list_files(args: Dict) -> str:
 
 
 async def _run_bash(args: Dict) -> str:
-    cmd = args["command"]
-    timeout = min(int(args.get("timeout", 30)), 60)
-    workspace = _active_workspace()
-    loop = asyncio.get_event_loop()
-
-    def _run():
-        result = subprocess.run(
-            cmd, shell=True, cwd=str(workspace),
-            capture_output=True, text=True, timeout=timeout,
-        )
-        out = result.stdout + result.stderr
-        return out[:4000] + ("…[truncated]" if len(out) > 4000 else "")
-
-    try:
-        return await loop.run_in_executor(None, _run)
-    except subprocess.TimeoutExpired:
-        return f"Command timed out after {timeout}s"
+    result = await run_shell(
+        _active_workspace(),
+        args["command"],
+        timeout=int(args.get("timeout", 30)),
+    )
+    out = result.combined
+    if result.exit_code != 0:
+        out += f"\n[exit_code={result.exit_code}; execution_mode={result.mode}]"
+    else:
+        out += f"\n[execution_mode={result.mode}]"
+    return out[:8000] + ("…[truncated]" if len(out) > 8000 else "")
 
 
 async def _run_python(args: Dict) -> str:
-    code = args["code"]
-    timeout = min(int(args.get("timeout", 30)), 60)
-    workspace = str(_active_workspace())
-    loop = asyncio.get_event_loop()
-
-    def _run():
-        result = subprocess.run(
-            [sys.executable, "-c", code],
-            cwd=workspace, capture_output=True, text=True, timeout=timeout,
-        )
-        out = result.stdout + result.stderr
-        return out[:4000] + ("…[truncated]" if len(out) > 4000 else "")
-
-    try:
-        return await loop.run_in_executor(None, _run)
-    except subprocess.TimeoutExpired:
-        return f"Python execution timed out after {timeout}s"
+    result = await execute_python_code(
+        _active_workspace(),
+        args["code"],
+        timeout=int(args.get("timeout", 30)),
+    )
+    out = result.combined
+    if result.exit_code != 0:
+        out += f"\n[exit_code={result.exit_code}; execution_mode={result.mode}]"
+    else:
+        out += f"\n[execution_mode={result.mode}]"
+    return out[:8000] + ("…[truncated]" if len(out) > 8000 else "")
 
 
 async def _search_files(args: Dict) -> str:
@@ -1110,7 +1352,9 @@ async def _generate_image(args: Dict, image_fn=None) -> str:
     import time
 
     prompt = args["prompt"]
-    filename = (args.get("filename") or "").strip()
+    # Tool contract accepts a filename, not a nested path. A single directory
+    # keeps the generated asset and its persisted reference unambiguous.
+    filename = Path((args.get("filename") or "").strip()).name
     if not filename:
         filename = f"image_{int(time.time())}.png"
     if not filename.endswith(".png"):
