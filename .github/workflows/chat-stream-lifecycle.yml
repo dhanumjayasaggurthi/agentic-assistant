@@ -43,6 +43,7 @@ jobs:
         run: |
           npm install --no-save --no-package-lock --ignore-scripts mermaid@10.9.3 jsdom@25.0.1
           node tests/mermaid_parser_smoke.mjs
+          node tests/visual_dom_smoke.mjs
       - name: Verify permissions and unstripped exports
         run: python -m unittest -v tests.test_rich_export_permissions
       - name: Compile frontend JSX (syntax and structure)
