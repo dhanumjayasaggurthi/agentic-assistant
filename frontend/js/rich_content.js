@@ -9,10 +9,29 @@ const RdiRichContent = (() => {
       /^(?:graph\s+(?:TD|TB|BT|LR|RL)\b|flowchart\s+(?:TD|TB|BT|LR|RL)\b|sequenceDiagram\b|classDiagram\b|erDiagram\b|stateDiagram(?:-v2)?\b|gantt\b|pie\b|journey\b|mindmap\b|timeline\b|xychart-beta\b)/i.test(code.trimStart());
   }
 
+  function normalizeMermaid(source) {
+    // Flowchart labels with HTML or parentheses must be quoted in Mermaid.
+    // Repair only simple square-bracket node labels; retain original source.
+    return source.replace(/\b([A-Za-z_][\w-]*)\[([^\]\r\n]*)\]/g, (match, id, label) => {
+      if (/^"[^"]*"$/.test(label.trim())) return match;
+      const clean = label
+        .replace(/<br\s*\/?\s*>/gi, '<br/>')
+        .replace(/<\/?(?:code|b|strong|em|i)>/gi, '')
+        .replace(/"/g, '&quot;');
+      return id + '["' + clean + '"]';
+    });
+  }
+
   function parseChart(code, language = '') {
-    if (!['chart', 'chartjs'].includes(language)) return null;
+    if (!['chart', 'chartjs', 'json'].includes(language)) return null;
     let config;
-    try { config = JSON.parse(code); } catch (_) { return null; }
+    try { config = JSON.parse(code); }
+    catch (_) {
+      if (['chart', 'chartjs'].includes(language) || /"type"\s*:\s*"(?:bar|line|pie|doughnut|scatter)"/.test(code)) {
+        throw new Error('Chart configuration is invalid JSON. Regenerate a valid fenced chart JSON block.');
+      }
+      return null;
+    }
     if (!config || !['bar', 'line', 'pie', 'doughnut', 'scatter'].includes(config.type)) return null;
     const input = config.data || {};
     if (!Array.isArray(input.datasets)) return null;
@@ -31,8 +50,78 @@ const RdiRichContent = (() => {
         return Number.isFinite(Number(value)) ? Number(value) : null;
       }),
     }));
-    return { type: config.type, data: { labels, datasets },
-             options: { responsive: true, maintainAspectRatio: false, animation: false } };
+    const options = { responsive: true, maintainAspectRatio: false, animation: false };
+    const supplied = config.options || {};
+    const title = supplied.plugins?.title;
+    if (title && typeof title.text === 'string') {
+      options.plugins = { title: { display: title.display !== false, text: title.text.slice(0, 300) } };
+    }
+    if (supplied.scales && ['bar', 'line', 'scatter'].includes(config.type)) {
+      options.scales = {};
+      for (const axis of ['x', 'y']) {
+        const axisInput = supplied.scales[axis] || {};
+        const caption = axisInput.title;
+        options.scales[axis] = {
+          beginAtZero: axisInput.beginAtZero === true,
+          title: { display: caption?.display === true,
+                   text: typeof caption?.text === 'string' ? caption.text.slice(0, 100) : '' },
+        };
+      }
+    }
+    return { type: config.type, data: { labels, datasets }, options };
+  }
+
+  function workspaceImagePath(value) {
+    if (typeof value !== 'string') return null;
+    let candidate = value.trim();
+    if (/^(?:https?:|data:|blob:|file:|\/\/)/i.test(candidate)) return null;
+    candidate = candidate.replace(/^\.\//, '').replace(/^\//, '')
+      .replace(/^workspace\//, '');
+    if (!candidate.startsWith('images/')) return null;
+    try { candidate = decodeURIComponent(candidate); } catch (_) { return null; }
+    const parts = candidate.split('/');
+    if (parts.length < 2 || parts.some(part => !part || part === '.' || part === '..' ||
+        /[\\\x00-\x1f?#]/.test(part))) return null;
+    if (!/\.(png|jpe?g|webp|gif|svg)$/i.test(candidate)) return null;
+    return candidate;
+  }
+
+  async function fetchWorkspaceImage(path, conversationId, headers = {}) {
+    const safe = workspaceImagePath(path);
+    if (!safe || !conversationId) throw new Error('Image is not associated with an active conversation');
+    const url = '/workspace/download/' + encodeURIComponent(safe) +
+      '?conv_id=' + encodeURIComponent(conversationId);
+    const response = await fetch(url, { headers, cache: 'no-store' });
+    if (!response.ok) throw new Error('Image file unavailable (HTTP ' + response.status + ')');
+    const blob = await response.blob();
+    if (!blob.type.startsWith('image/')) throw new Error('Expected an image, received ' + blob.type);
+    return blob;
+  }
+
+  async function loadWorkspaceImages(root, conversationId, headers = {}) {
+    const images = root.querySelectorAll('img[data-rdi-workspace-path]');
+    await Promise.all(Array.from(images, async img => {
+      if (img.dataset.rdiLoading) return;
+      img.dataset.rdiLoading = 'true';
+      const path = img.dataset.rdiWorkspacePath;
+      try {
+        const blob = await fetchWorkspaceImage(path, conversationId, headers);
+        if (!img.isConnected) return;
+        const url = URL.createObjectURL(blob);
+        img.src = url;
+        img.hidden = false;
+        const observer = new MutationObserver(() => {
+          if (!img.isConnected) { URL.revokeObjectURL(url); observer.disconnect(); }
+        });
+        observer.observe(root, { subtree: true, childList: true });
+      } catch (err) {
+        if (!img.isConnected) return;
+        const info = document.createElement('span');
+        info.className = 'rich-error';
+        info.textContent = 'Image unavailable (' + path + '): ' + err.message;
+        img.replaceWith(info);
+      }
+    }));
   }
 
   async function copyPngFromSvg(svg) {
@@ -81,8 +170,9 @@ const RdiRichContent = (() => {
     } finally { bmp.close(); }
   }
 
-  async function enhance(root) {
+  async function enhance(root, conversationId, headers = {}) {
     if (!root) return;
+    await loadWorkspaceImages(root, conversationId, headers);
     if (window.mermaid && !initialized) {
       window.mermaid.initialize({ startOnLoad: false, securityLevel: 'strict', theme: 'neutral' });
       initialized = true;
@@ -124,7 +214,7 @@ const RdiRichContent = (() => {
         if (isDiagram) {
           if (!window.mermaid) throw new Error('Diagram renderer unavailable (check corporate CDN access)');
           const id = 'rdi-visual-' + (++sequence);
-          const result = await window.mermaid.render(id, source);
+          const result = await window.mermaid.render(id, normalizeMermaid(source));
           if (!figure.isConnected) continue;
           // SVG from Mermaid is sanitized again before insertion.
           graphics.innerHTML = DOMPurify.sanitize(result.svg, { USE_PROFILES: { svg: true, svgFilters: true } });
@@ -160,5 +250,6 @@ const RdiRichContent = (() => {
     }
   }
 
-  return { enhance, isMermaidCode, parseChart, copyImage };
+  return { enhance, isMermaidCode, normalizeMermaid, parseChart,
+           workspaceImagePath, fetchWorkspaceImage, copyImage };
 })();
