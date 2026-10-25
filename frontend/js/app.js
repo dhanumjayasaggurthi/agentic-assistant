@@ -444,6 +444,13 @@ function RunCard({ run }) {
 
 function ActivityPanel({ events = [], live = false, run = null }) {
   const [expanded, setExpanded] = useState(live);
+  const [elapsed, setElapsed] = useState(0);
+  useEffect(() => {
+    if (!live) return;
+    const started = Date.now();
+    const id = setInterval(() => setElapsed(Math.floor((Date.now() - started) / 1000)), 1000);
+    return () => clearInterval(id);
+  }, [live]);
   if (!live && !events.length && !run) return null;
   const current = events.length ? events[events.length - 1].action : 'Preparing response…';
   return (
@@ -452,7 +459,7 @@ function ActivityPanel({ events = [], live = false, run = null }) {
               onClick={() => setExpanded(value => !value)}>
         {live && <span className="activity-pulse" aria-label="In progress" />}
         <span className="activity-summary">{live ? current : 'View completed activity'}</span>
-        <span className="activity-toggle-hint">{expanded ? 'Hide details' : 'Show details'}</span>
+        <span className="activity-toggle-hint">{live ? elapsed + 's · ' : ''}{expanded ? 'Hide details' : 'Show details'}</span>
         <Ic.down />
       </button>
       {expanded && (
