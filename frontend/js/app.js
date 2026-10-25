@@ -483,9 +483,14 @@ function ActivityPanel({ events = [], live = false, run = null }) {
 function Message({ msg, onSpeak, onImageClick, streaming }) {
   const bodyRef = useRef(null);
   useEffect(() => {
-    if (bodyRef.current && window.Prism) {
-      bodyRef.current.querySelectorAll('pre code').forEach(el => { try { Prism.highlightElement(el); } catch (e) {} });
-    }
+    const timer = setTimeout(() => {
+      if (!bodyRef.current) return;
+      if (window.RdiRichContent) window.RdiRichContent.enhance(bodyRef.current);
+      if (window.Prism) bodyRef.current.querySelectorAll('pre code').forEach(el => {
+        try { Prism.highlightElement(el); } catch (e) {}
+      });
+    }, streaming ? 200 : 0);
+    return () => clearTimeout(timer);
   }, [msg.content, streaming]);
 
   if (msg.role === 'user') {
@@ -515,9 +520,14 @@ function Message({ msg, onSpeak, onImageClick, streaming }) {
         <div className={'img-grid ' + (images.length === 1 ? 'g1' : images.length === 2 ? 'g2' : '')} style={{ marginBottom: 14 }}>
           {images.map((a, i) => (
             <div className="img-cell" key={i} onClick={() => onImageClick(a)}>
-              <img src={`data:image/png;base64,${a.content}`} alt={a.name} />
+              <img src={`data:${a.type || 'image/png'};base64,${a.content}`} alt={a.name} />
               <div className="img-cell-bar">
                 <span className="lbl">{a.name}</span>
+                <button onClick={async e => {
+                  e.stopPropagation();
+                  try { await RdiRichContent.copyImage(a.content, a.type || 'image/png'); }
+                  catch (err) { alert('Cannot copy image: ' + err.message); }
+                }}>copy image</button>
                 <button onClick={e => { e.stopPropagation(); onImageClick(a, 'edit'); }}>edit</button>
                 <button onClick={e => { e.stopPropagation(); onImageClick(a, 'vary'); }}>vary</button>
               </div>
@@ -575,6 +585,23 @@ function Composer({ conv, agentMode, model, onOpenModel, onSend, onStop, busy, d
     e.target.value = '';
   };
 
+  const onPaste = e => {
+    // Retain normal pasted text. Upload clipboard images/files as attachments.
+    const files = [...(e.clipboardData?.items || [])]
+      .filter(item => item.kind === 'file')
+      .map(item => item.getAsFile())
+      .filter(Boolean);
+    if (!files.length) return;
+    e.preventDefault();
+    files.forEach((file, index) => {
+      const ext = (file.type.split('/')[1] || 'png').replace('jpeg', 'jpg');
+      const needsName = !file.name || file.name === 'image.png' || file.name === 'blob';
+      uploadFile(needsName
+        ? new File([file], `pasted-${Date.now()}-${index}.${ext}`, { type: file.type })
+        : file);
+    });
+  };
+
   const toggleRec = async () => {
     if (recording) {
       recRef.current && recRef.current.stop();
@@ -630,6 +657,8 @@ function Composer({ conv, agentMode, model, onOpenModel, onSend, onStop, busy, d
               </span>
               <span className="spacer" />
               <button className="btn-allow" onClick={() => onPermission('allow')}>Allow</button>
+              <button className="btn-allow" title={`Always approve ${permission.tool} while this conversation is active`}
+                      onClick={() => onPermission('allow', true)}>Always Allow</button>
               <button className="btn-deny" onClick={() => onPermission('deny')}>Deny</button>
             </div>
             {permission.preview && <div className="perm-code">{permission.preview}</div>}
@@ -666,7 +695,8 @@ function Composer({ conv, agentMode, model, onOpenModel, onSend, onStop, busy, d
             </div>
           )}
           <textarea ref={taRef} rows="1" value={text} placeholder={placeholder}
-                    onChange={e => { setText(e.target.value); grow(); }} onKeyDown={onKey} disabled={disabled} />
+                    onChange={e => { setText(e.target.value); grow(); }} onKeyDown={onKey}
+                    onPaste={onPaste} disabled={disabled} />
           <div className="composer-tools">
             <input ref={fileRef} type="file" multiple style={{ display: 'none' }} onChange={pickFiles} />
             <button className="tool-btn" title="Attach files" onClick={() => fileRef.current.click()}><Ic.clip /></button>
@@ -1304,6 +1334,10 @@ function App() {
       pushToast(d.reason || 'Using tools automatically for this request');
     });
     RdiWS.on('permission', d => setPermission(d));
+    RdiWS.on('permission_timeout', d => {
+      setPermission(null);
+      pushToast(d.message || 'Permission expired; tool not executed', true);
+    });
     RdiWS.on('permission_auto', d => pushToast(`auto-approved read-only: ${d.tool}`));
     RdiWS.on('auto_allow_set', d => setAutoAllow(!!d.enabled));
 
@@ -1496,9 +1530,11 @@ function App() {
     if (!RdiWS.isConnected()) pushToast('Offline — message queued, will send on reconnect');
   };
 
-  const decidePermission = (decision) => {
+  const decidePermission = (decision, always = false) => {
     if (!permission) return;
-    RdiWS.send({ type: 'permission', request_id: permission.request_id, decision });
+    RdiWS.send({ type: 'permission', request_id: permission.request_id,
+                 decision, always: !!always });
+    if (always) pushToast(`${permission.tool} auto-approved for this active conversation`);
     setPermission(null);
   };
 
@@ -1516,6 +1552,12 @@ function App() {
 
   const exportConv = (fmt) => {
     if (!convId) return;
+    if (fmt === 'pdf') {
+      // Browser print preserves visible Mermaid SVG, charts, code and tables.
+      // The user chooses Save as PDF; server remains an API fallback.
+      window.print();
+      return;
+    }
     downloadBlob(`/conversations/${convId}/export?format=${fmt}`, `${convTitle || 'conversation'}.${fmt}`);
   };
 
