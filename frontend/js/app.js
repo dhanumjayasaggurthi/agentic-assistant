@@ -525,14 +525,18 @@ function Message({ msg, onSpeak, onImageClick, streaming, conversationId }) {
     // Streaming text stays incremental. Parse charts, SVG and workspace images
     // only when the completed fenced block is stable, avoiding repeated work.
     if (streaming) return;
+    const root = bodyRef.current;
     const timer = setTimeout(() => {
-      if (!bodyRef.current) return;
-      RdiRichContent.enhance(bodyRef.current, conversationId, Auth.authHeaders());
-      if (window.Prism) bodyRef.current.querySelectorAll('pre code').forEach(el => {
+      if (!root) return;
+      RdiRichContent.enhance(root, conversationId, Auth.authHeaders());
+      if (window.Prism) root.querySelectorAll('pre code').forEach(el => {
         try { Prism.highlightElement(el); } catch (e) {}
       });
     }, 0);
-    return () => clearTimeout(timer);
+    return () => {
+      clearTimeout(timer);
+      if (root) RdiRichContent.cleanup(root);
+    };
   }, [msg.content, streaming, conversationId]);
 
   if (msg.role === 'user') {
