@@ -3,6 +3,7 @@
 Storage: PostgreSQL + pgvector (REQUIRED — see docker-compose.postgres.yml).
 Startup fails fast with a clear message when the database is not configured.
 """
+import asyncio
 import base64
 import io
 import sys
@@ -560,93 +561,24 @@ async def admin_costs(
 # ── Conversation export ───────────────────────────────────────────────────────
 
 def _strip_md(text: str) -> str:
-    import re
-    text = re.sub(r'```[\s\S]*?```', '[code block]', text)
-    text = re.sub(r'`[^`]+`', lambda m: m.group(0)[1:-1], text)
-    text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
-    text = re.sub(r'[*_~]', '', text)
-    return text.strip()
+    """Legacy helper kept for callers; no content removal is permitted."""
+    return text or ""
 
 
 def _export_pdf(title: str, messages: list) -> io.BytesIO:
-    from fpdf import FPDF
-    from .agents.tools import pdf_safe_text
-    pdf = FPDF()
-    pdf.add_page()
-    pdf.set_margins(20, 20, 20)
-    pdf.set_auto_page_break(auto=True, margin=20)
-
-    # Title
-    pdf.set_font("Helvetica", "B", 16)
-    pdf.cell(0, 10, pdf_safe_text(title[:80]), new_x="LMARGIN", new_y="NEXT", align="C")
-    pdf.ln(4)
-
-    for msg in messages:
-        role = (msg["role"] or "").upper()
-        content = _strip_md(msg.get("content") or "")
-        if not content:
-            continue
-
-        # Role label
-        pdf.set_font("Helvetica", "B", 10)
-        if role == "USER":
-            pdf.set_text_color(120, 70, 40)
-        else:
-            pdf.set_text_color(80, 60, 160)
-        pdf.cell(0, 7, f"[{role}]", new_x="LMARGIN", new_y="NEXT")
-        pdf.set_text_color(30, 25, 20)
-
-        # Content
-        pdf.set_font("Helvetica", size=10)
-        for line in content.split("\n"):
-            safe = pdf_safe_text(line.rstrip())
-            if safe.strip():
-                pdf.multi_cell(0, 6, safe, new_x="LMARGIN", new_y="NEXT")
-            else:
-                pdf.ln(2)
-        pdf.ln(5)
-
-    raw = pdf.output()
-    buf = io.BytesIO(raw)
-    buf.seek(0)
-    return buf
+    from .chat_export import export_pdf
+    return export_pdf(title, messages)
 
 
 def _export_docx(title: str, messages: list) -> io.BytesIO:
-    from docx import Document
-    from docx.shared import Pt, RGBColor
-    doc = Document()
-    doc.add_heading(title[:80], 0)
-
-    for msg in messages:
-        role = (msg["role"] or "").upper()
-        content = _strip_md(msg.get("content") or "")
-        if not content:
-            continue
-
-        # Role heading
-        p = doc.add_paragraph()
-        run = p.add_run(f"[{role}]")
-        run.bold = True
-        if role == "USER":
-            run.font.color.rgb = RGBColor(0x78, 0x46, 0x28)
-        else:
-            run.font.color.rgb = RGBColor(0x50, 0x3C, 0xA0)
-        run.font.size = Pt(10)
-
-        # Content paragraph
-        doc.add_paragraph(content)
-
-    buf = io.BytesIO()
-    doc.save(buf)
-    buf.seek(0)
-    return buf
+    from .chat_export import export_docx
+    return export_docx(title, messages)
 
 
 @app.get("/conversations/{conv_id}/export")
 async def export_conversation(
     conv_id: str,
-    format: str = Query("pdf", pattern=r"^(pdf|docx)$"),
+    format: str = Query("pdf", pattern=r"^(pdf|docx|md)$"),
     user=Depends(get_current_user),
 ):
     conv = await get_conversation(conv_id, user["id"])
@@ -657,20 +589,30 @@ async def export_conversation(
     title = conv.get("title") or "Conversation"
     safe_title = "".join(c for c in title if c.isalnum() or c in " _-")[:40].strip() or "conversation"
 
-    if format == "pdf":
-        buf = _export_pdf(title, msgs)
+    if format == "md":
+        # Lossless, machine-readable export of every message and code fence.
+        parts = [f"# {title}"]
+        for m in msgs:
+            parts.append(f"\n## {(m.get('role') or 'assistant').upper()}\n\n{m.get('content') or ''}")
+        data = "\n".join(parts).encode("utf-8")
         return StreamingResponse(
-            buf,
-            media_type="application/pdf",
-            headers={"Content-Disposition": f'attachment; filename="{safe_title}.pdf"'},
+            io.BytesIO(data), media_type="text/markdown; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="{safe_title}.md"'},
         )
-    else:
-        buf = _export_docx(title, msgs)
-        return StreamingResponse(
-            buf,
-            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            headers={"Content-Disposition": f'attachment; filename="{safe_title}.docx"'},
-        )
+    try:
+        if format == "pdf":
+            buf = await asyncio.to_thread(_export_pdf, title, msgs)
+            mime = "application/pdf"
+        else:
+            buf = await asyncio.to_thread(_export_docx, title, msgs)
+            mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    except Exception as exc:
+        # Never substitute a lossy shortened document on encoding/render failure.
+        raise HTTPException(status_code=422, detail=f"Export could not preserve content: {exc}") from exc
+    return StreamingResponse(
+        buf, media_type=mime,
+        headers={"Content-Disposition": f'attachment; filename="{safe_title}.{format}"'},
+    )
 
 
 # ── WebSocket ─────────────────────────────────────────────────────────────────
