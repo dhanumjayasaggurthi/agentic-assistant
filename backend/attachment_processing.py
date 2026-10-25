@@ -40,7 +40,7 @@ class _Sink:
 def _text_encoding(path: Path) -> str:
     with path.open("rb") as src:
         bom = src.read(4)
-    return "utf-16" if bom.startswith((b"\\xff\\xfe", b"\\xfe\\xff")) else "utf-8-sig"
+    return "utf-16" if bom.startswith((bytes.fromhex("fffe"), bytes.fromhex("feff"))) else "utf-8-sig"
 
 
 def _read_text(path: Path, sink: _Sink, replace_errors: bool = False):
