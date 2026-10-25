@@ -90,6 +90,7 @@ const RdiRichContent = (() => {
     for (const codeEl of root.querySelectorAll('pre > code')) {
       const language = (codeEl.className.match(/language-([\w-]+)/) || [,''])[1].toLowerCase();
       const source = codeEl.textContent || '';
+      const originalPre = codeEl.parentElement;
       const isDiagram = isMermaidCode(source, language);
       let chart = null;
       try { chart = parseChart(source, language); }
@@ -100,7 +101,6 @@ const RdiRichContent = (() => {
         continue; // Original full code remains visible and copyable.
       }
       if (!isDiagram && !chart) continue;
-      const originalPre = codeEl.parentElement;
       if (originalPre.dataset.richRendered) continue;
       originalPre.dataset.richRendered = 'true';
       const figure = document.createElement('figure');
