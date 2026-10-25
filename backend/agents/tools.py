@@ -1249,7 +1249,9 @@ async def _generate_image(args: Dict, image_fn=None) -> str:
     import time
 
     prompt = args["prompt"]
-    filename = (args.get("filename") or "").strip()
+    # Tool contract accepts a filename, not a nested path. A single directory
+    # keeps the generated asset and its persisted reference unambiguous.
+    filename = Path((args.get("filename") or "").strip()).name
     if not filename:
         filename = f"image_{int(time.time())}.png"
     if not filename.endswith(".png"):
