@@ -1406,6 +1406,17 @@ function App() {
     });
 
     RdiWS.on('resume_ok', d => {
+      if (typeof d.snapshot === 'string') {
+        streamRef.current = d.snapshot;
+        setStreamText(d.snapshot);
+        RdiWS.setActiveConversation(convRef.current, d.current_seq || 0);
+      }
+      if (d.reload_required && convRef.current) {
+        // Completed message is in PostgreSQL, not in the finite replay buffer.
+        loadTargetRef.current = convRef.current;
+        RdiWS.setActiveConversation(convRef.current, d.current_seq || 0);
+        RdiWS.send({ type: 'load_conversation', conversation_id: convRef.current });
+      }
       if (d.replayed > 0) pushToast(`Reconnected — resumed stream (${d.replayed} events replayed)`);
       if (d.running) { busyRef.current = true; setBusy(true); }
     });
