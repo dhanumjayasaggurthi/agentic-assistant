@@ -783,7 +783,9 @@ class WSSession:
         import shutil
         workspace = self._conv_workspace(cid)
         enriched_msg = user_msg
-        atts = _normalize_attachments(attachments)
+        # Already ownership-validated by _hydrate_attachments. Do not run the
+        # client-handle normalizer again (it strips trusted storage_path).
+        atts = [dict(a) for a in (attachments or []) if isinstance(a, dict)]
         references = []
         for att in atts:
             name = Path(att.get("name", "file")).name
