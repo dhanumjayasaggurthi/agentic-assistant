@@ -91,6 +91,7 @@ class StreamState:
         self.perm_events: Dict[str, asyncio.Event] = {}
         self.perm_decisions: Dict[str, str] = {}
         self.auto_allow_readonly = False
+        self.auto_allow_tools: set[str] = set()
         self.task: Optional[asyncio.Task] = None
         self._emit_lock = asyncio.Lock()
 
@@ -116,6 +117,8 @@ class StreamState:
 
 _STREAMS: Dict[str, StreamState] = {}
 _PERM_INDEX: Dict[str, str] = {}  # request_id -> stream key
+_PERM_TOOL_INDEX: Dict[str, str] = {}  # tool name for approved permission prompt
+_PERMISSION_TIMEOUT_SECONDS = 30 * 60
 _logger = logging.getLogger(__name__)
 
 
@@ -384,6 +387,7 @@ class WSSession:
         st.task = None
         for permission_id, event in list(st.perm_events.items()):
             _PERM_INDEX.pop(permission_id, None)
+            _PERM_TOOL_INDEX.pop(permission_id, None)
             st.perm_events.pop(permission_id, None)
             event.set()
         st.perm_decisions.clear()
@@ -802,7 +806,7 @@ class WSSession:
         async def _perm_fn(rid: str, tool: str, args: dict, preview: str) -> bool:
             icon = _TOOL_ICONS.get(tool, "🔧")
             # Auto-approve read-only tools when the user opted in.
-            if st.auto_allow_readonly and tool in READONLY_TOOLS:
+            if (st.auto_allow_readonly and tool in READONLY_TOOLS) or tool in st.auto_allow_tools:
                 step = _find_step(rid) or {"rid": rid, "tool": tool}
                 step["permission"] = "auto_allowed"
                 await st.emit({
@@ -814,6 +818,7 @@ class WSSession:
             event = asyncio.Event()
             st.perm_events[rid] = event
             _PERM_INDEX[rid] = st.key
+            _PERM_TOOL_INDEX[rid] = tool
             step = _find_step(rid)
             if step is None:
                 step = {"rid": rid, "tool": tool, "label": _tool_label(tool, args),
@@ -832,11 +837,22 @@ class WSSession:
             })
             await st.emit({"type": "run_step", "run_id": run_id, "steps": _public_steps(steps)})
             await _ckpt("waiting_permission")
-            if rid not in st.perm_decisions:
-                await event.wait()
-            st.perm_events.pop(rid, None)
-            _PERM_INDEX.pop(rid, None)
+            timed_out = False
+            try:
+                if rid not in st.perm_decisions:
+                    try:
+                        await asyncio.wait_for(event.wait(), timeout=_PERMISSION_TIMEOUT_SECONDS)
+                    except asyncio.TimeoutError:
+                        timed_out = True
+            finally:
+                st.perm_events.pop(rid, None)
+                _PERM_INDEX.pop(rid, None)
+                _PERM_TOOL_INDEX.pop(rid, None)
             decision = st.perm_decisions.pop(rid, "deny")
+            if timed_out:
+                decision = "timeout"
+                await st.emit({"type": "permission_timeout", "request_id": rid,
+                               "message": "Permission timed out. Tool not executed; ask to continue."})
             step["permission"] = decision
             step["status"] = "running" if decision == "allow" else "denied"
             await st.emit({"type": "run_step", "run_id": run_id, "steps": _public_steps(steps)})
@@ -995,12 +1011,17 @@ class WSSession:
     async def _handle_permission(self, data: dict) -> None:
         rid = data.get("request_id", "")
         decision = data.get("decision", "deny")
+        always = bool(data.get("always"))
         # Route via the stream index so a decision after reconnect still lands.
         key = _PERM_INDEX.get(rid)
         st = _STREAMS.get(key) if key else None
         if st is None and self.conversation_id:
             st = _STREAMS.get(_stream_key(self.user["id"], self.conversation_id))
         if st is not None:
+            if always and decision == "allow":
+                tool = _PERM_TOOL_INDEX.get(rid)
+                if tool:
+                    st.auto_allow_tools.add(tool)
             st.perm_decisions[rid] = decision
             event = st.perm_events.pop(rid, None)
             if event:
