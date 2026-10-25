@@ -1139,6 +1139,7 @@ function App() {
   const [messages, setMessages] = useState([]);
   const [streamText, setStreamText] = useState('');
   const [streamRun, setStreamRun] = useState(null);
+  const [activity, setActivity] = useState([]);
   const [busy, setBusy] = useState(false);
   const [model, setModel] = useState(localStorage.getItem('rdi_model') || 'gpt-4.1-global');
   const [modelOpen, setModelOpen] = useState(false);
@@ -1163,6 +1164,10 @@ function App() {
 
   const streamRef = useRef('');
   const runRef = useRef(null);
+  const activityRef = useRef([]);
+  const pendingRequestRef = useRef(null);
+  const loadTargetRef = useRef(null);
+  const busyRef = useRef(false);
   const modelRef = useRef(model);
   const convRef = useRef(convId);
   useEffect(() => { modelRef.current = model; }, [model]);
@@ -1209,11 +1214,17 @@ function App() {
     });
     RdiWS.on('conversations', d => setConvs(d.conversations || []));
     RdiWS.on('conversation_created', d => {
+      // The creation acknowledgement may arrive after the user clicked New chat.
+      if (!d.request_id || d.request_id !== pendingRequestRef.current) return;
+      convRef.current = d.id;
       setConvId(d.id); setConvTitle(d.conversation.title);
       RdiWS.setActiveConversation(d.id, 0);
-      setConvs(cs => [d.conversation, ...cs]);
+      setConvs(cs => [d.conversation, ...cs.filter(c => c.id !== d.id)]);
     });
     RdiWS.on('conversation_loaded', d => {
+      if (loadTargetRef.current !== d.conversation.id) return;
+      loadTargetRef.current = null;
+      convRef.current = d.conversation.id;
       setConvId(d.conversation.id);
       setConvTitle(d.conversation.title);
       setModel(d.conversation.model || modelRef.current);
@@ -1221,17 +1232,25 @@ function App() {
       setMessages((d.messages || []).map(m => ({
         role: m.role, content: m.content, attachments: m.attachments || [],
       })));
-      setStreamText(''); streamRef.current = '';
-      setStreamRun(d.running && d.last_run ? { steps: d.last_run.steps || [] } : null);
-      runRef.current = null;
-      setBusy(!!d.running);
+      streamRef.current = d.partial_text || '';
+      setStreamText(streamRef.current);
+      activityRef.current = d.activity_log || [];
+      setActivity(activityRef.current);
+      runRef.current = d.running && d.last_run ? { steps: d.last_run.steps || [] } : null;
+      setStreamRun(runRef.current);
+      busyRef.current = !!d.running;
+      setBusy(busyRef.current);
       RdiWS.setActiveConversation(d.conversation.id, d.current_seq || 0);
       RdiWS.send({ type: 'get_artifacts', conversation_id: d.conversation.id });
       RdiWS.send({ type: 'get_workspace' });
     });
     RdiWS.on('conversation_deleted', d => {
       setConvs(cs => cs.filter(c => c.id !== d.id));
-      if (convRef.current === d.id) { setConvId(null); setMessages([]); setStreamText(''); setStreamRun(null); }
+      if (convRef.current === d.id) {
+        convRef.current = null; RdiWS.setActiveConversation(null, 0);
+        setConvId(null); setMessages([]); setStreamText(''); setStreamRun(null);
+        activityRef.current = []; setActivity([]); busyRef.current = false; setBusy(false);
+      }
     });
     RdiWS.on('conversation_renamed', d => {
       setConvs(cs => cs.map(c => c.id === d.id ? { ...c, title: d.title } : c));
@@ -1241,15 +1260,20 @@ function App() {
     RdiWS.on('token', d => {
       streamRef.current += d.text;
       setStreamText(streamRef.current);
+      busyRef.current = true;
       setBusy(true);
     });
     RdiWS.on('done', () => {
       finalizeStream();
+      busyRef.current = false;
+      pendingRequestRef.current = null;
       setBusy(false);
       RdiWS.send({ type: 'list_conversations' });
     });
     RdiWS.on('error', d => {
-      if (streamRef.current) finalizeStream();
+      if (streamRef.current || runRef.current) finalizeStream();
+      busyRef.current = false;
+      pendingRequestRef.current = null;
       setBusy(false);
       pushToast(d.message || 'Something went wrong', true);
     });
@@ -1275,16 +1299,31 @@ function App() {
     RdiWS.on('auto_allow_set', d => setAutoAllow(!!d.enabled));
 
     RdiWS.on('tool_result', () => {});
-    RdiWS.on('activity', () => {});
-    RdiWS.on('activity_done', () => setBusy(false));
+    RdiWS.on('activity', d => {
+      activityRef.current = [...activityRef.current, { action: d.action || 'Working…', icon: d.icon || '·' }].slice(-16);
+      setActivity(activityRef.current);
+    });
+    RdiWS.on('activity_done', () => {
+      busyRef.current = false;
+      pendingRequestRef.current = null;
+      setBusy(false);
+    });
     RdiWS.on('cancelled', d => {
       if (streamRef.current || runRef.current) finalizeStream();
+      busyRef.current = false;
+      pendingRequestRef.current = null;
       setBusy(false);
       setPermission(null);
       pushToast(d.message || 'Run stopped');
     });
-    RdiWS.on('workspace', d => { setWsFiles(d.files || []); if (d.workspace_mode) setWsMode(d.workspace_mode); });
-    RdiWS.on('artifacts', d => setArtifacts(d.artifacts || []));
+    RdiWS.on('workspace', d => {
+      if (d.conv_id && d.conv_id !== convRef.current) return;
+      setWsFiles(d.files || []); if (d.workspace_mode) setWsMode(d.workspace_mode);
+    });
+    RdiWS.on('artifacts', d => {
+      if (d.conv_id !== convRef.current) return;
+      setArtifacts(d.artifacts || []);
+    });
     RdiWS.on('workspace_settings_updated', d => {
       setWsMode(d.mode); setWsCustomPath(d.custom_path || '');
       pushToast('Workspace settings saved');
@@ -1311,7 +1350,7 @@ function App() {
 
     RdiWS.on('resume_ok', d => {
       if (d.replayed > 0) pushToast(`Reconnected — resumed stream (${d.replayed} events replayed)`);
-      if (d.running) setBusy(true);
+      if (d.running) { busyRef.current = true; setBusy(true); }
     });
 
     RdiWS.connect((status, attempt) => {
@@ -1332,12 +1371,13 @@ function App() {
     const run = runRef.current;
     if (text || run) {
       setMessages(ms => [...ms, {
-        role: 'assistant', content: text, run,
+        role: 'assistant', content: text, run, activity: activityRef.current,
         meta: modelName(modelRef.current),
       }]);
     }
     streamRef.current = ''; setStreamText('');
     runRef.current = null; setStreamRun(null);
+    activityRef.current = []; setActivity([]);
     setPermission(null);
   };
 
@@ -1351,14 +1391,38 @@ function App() {
   }, []);
 
   /* ── Actions ── */
-  const newConversation = () => {
+  const resetActiveView = () => {
+    const oldId = convRef.current;
+    const oldRequest = pendingRequestRef.current;
+    if (busyRef.current) {
+      RdiWS.dropPending(oldRequest);
+      RdiWS.send({ type: 'stop', conversation_id: oldId, request_id: oldRequest });
+    }
+    pendingRequestRef.current = null;
+    loadTargetRef.current = null;
+    busyRef.current = false;
+    convRef.current = null;
+    RdiWS.setActiveConversation(null, 0);
     setConvId(null); setConvTitle(''); setMessages([]);
-    setStreamText(''); streamRef.current = '';
-    setStreamRun(null); runRef.current = null;
-    setPermission(null); setView('chat');
+    streamRef.current = ''; setStreamText('');
+    runRef.current = null; setStreamRun(null);
+    activityRef.current = []; setActivity([]);
+    setBusy(false); setPermission(null); setArtifacts([]);
+    setFallback(null);
+  };
+
+  const newConversation = () => {
+    resetActiveView();
+    setView('chat');
   };
 
   const openConv = (id) => {
+    if (id === convRef.current) return;
+    resetActiveView();
+    loadTargetRef.current = id;
+    convRef.current = id;
+    RdiWS.setActiveConversation(id, 0);
+    setConvId(id);
     setView('chat');
     RdiWS.send({ type: 'load_conversation', conversation_id: id });
   };
@@ -1399,16 +1463,22 @@ function App() {
   const sendMessage = (text, atts) => {
     const payloadAtts = atts.map(a => a.payload).filter(Boolean);
     const imgMode = isImageModel(model);
+    if (busyRef.current) return;
+    const requestId = 'turn-' + Date.now() + '-' + Math.random().toString(36).slice(2);
+    pendingRequestRef.current = requestId;
     setMessages(ms => [...ms, { role: 'user', content: text, attachments: payloadAtts }]);
+    busyRef.current = true;
     setBusy(true);
     streamRef.current = ''; setStreamText('');
     runRef.current = null; setStreamRun(null);
+    activityRef.current = []; setActivity([]);
     setFallback(null);
     if (imgMode) {
-      RdiWS.send({ type: 'generate_image', prompt: text, model, conversation_id: convId, attachments: payloadAtts });
+      RdiWS.send({ type: 'generate_image', request_id: requestId,
+                   prompt: text, model, conversation_id: convRef.current, attachments: payloadAtts });
     } else {
       RdiWS.send({
-        type: 'chat', message: text, model, conversation_id: convId,
+        type: 'chat', request_id: requestId, message: text, model, conversation_id: convRef.current,
         agent_mode: agentMode && !imgMode, auto_agent: true, attachments: payloadAtts,
       });
     }
@@ -1481,7 +1551,8 @@ function App() {
       disabled={false}
       onOpenModel={() => setModelOpen(true)}
       onSend={sendMessage}
-      onStop={() => RdiWS.send({ type: 'stop', conversation_id: convId })}
+      onStop={() => RdiWS.send({ type: 'stop', conversation_id: convRef.current,
+                                     request_id: pendingRequestRef.current })}
       attachments={attachments} setAttachments={setAttachments} uploadFile={uploadFile}
       guard={guard}
       onGuardDismiss={() => setGuard(null)}
@@ -1609,7 +1680,7 @@ function App() {
 
               <ChatView
                 conv={convId} messages={messages} streamText={streamText} streamRun={streamRun}
-                busy={busy} user={user} agentMode={agentMode} setAgentMode={setAgentMode}
+                busy={busy} activity={activity} user={user} agentMode={agentMode} setAgentMode={setAgentMode}
                 model={model} connState={conn}
                 recent={convs} onOpenConv={openConv}
                 onSuggestion={(s) => sendMessage(s, [])}
