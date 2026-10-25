@@ -3,6 +3,20 @@
 const RdiRichContent = (() => {
   let sequence = 0;
   let initialized = false;
+  const resourceDisposers = new WeakMap();
+
+  function trackResource(root, dispose) {
+    const items = resourceDisposers.get(root) || [];
+    items.push(dispose);
+    resourceDisposers.set(root, items);
+  }
+
+  function cleanup(root) {
+    for (const dispose of resourceDisposers.get(root) || []) {
+      try { dispose(); } catch (_) { /* resources may already be gone */ }
+    }
+    resourceDisposers.delete(root);
+  }
 
   function isMermaidCode(code, language = '') {
     return language === 'mermaid' ||
@@ -112,10 +126,7 @@ const RdiRichContent = (() => {
         const url = URL.createObjectURL(blob);
         img.src = url;
         img.hidden = false;
-        const observer = new MutationObserver(() => {
-          if (!img.isConnected) { URL.revokeObjectURL(url); observer.disconnect(); }
-        });
-        observer.observe(root, { subtree: true, childList: true });
+        trackResource(root, () => URL.revokeObjectURL(url));
       } catch (err) {
         if (!img.isConnected) return;
         const info = document.createElement('span');
@@ -239,11 +250,7 @@ const RdiRichContent = (() => {
             try { await copyCanvas(canvas); button.textContent = 'Copied'; }
             catch (err) { button.textContent = err.message; }
           };
-          // Cleanup when React replaces the streamed Markdown DOM.
-          const observer = new MutationObserver(() => {
-            if (!figure.isConnected) { instance.destroy(); observer.disconnect(); }
-          });
-          observer.observe(root, { childList: true, subtree: true });
+          trackResource(root, () => instance.destroy());
         }
       } catch (err) {
         const error = document.createElement('p');
@@ -256,6 +263,6 @@ const RdiRichContent = (() => {
     }
   }
 
-  return { enhance, isMermaidCode, normalizeMermaid, parseChart,
+  return { enhance, cleanup, isMermaidCode, normalizeMermaid, parseChart,
            workspaceImagePath, fetchWorkspaceImage, copyImage };
 })();
