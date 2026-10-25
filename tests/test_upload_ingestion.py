@@ -90,6 +90,31 @@ class AttachmentProcessingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("9999,Record 9999,19998", tail)
         self.assertIn("END_OF_FILE", tail)
 
+    async def test_single_oversized_row_has_cursor_and_no_content_loss(self):
+        path = self.path / "longline.txt"
+        payload = "ABCDEFGHIJ" * 5000
+        path.write_text(payload + "\n", encoding="utf-8")
+        cursor = 0
+        recovered = []
+        for _ in range(8):
+            result = await _read_file({"path": "longline.txt",
+                "start_line": 1, "end_line": 1,
+                "start_char": cursor, "max_chars": 8000})
+            part = result.split("\n[1] ", 1)[1].split("\n", 1)[0]
+            recovered.append(part)
+            if "NEXT_START_CHAR=" not in result:
+                break
+            cursor = int(result.split("NEXT_START_CHAR=", 1)[1].split()[0])
+        self.assertEqual("".join(recovered), payload)
+        self.assertIn("END_OF_FILE", result)
+
+    async def test_utf16_source_recognized_and_preserved(self):
+        path = self.path / "utf16.csv"
+        path.write_bytes("name,value\nAlpha,42\n".encode("utf-16"))
+        report = extract_attachment(path, "text/csv")
+        self.assertTrue(report["complete"])
+        self.assertEqual((self.path / "extracted.txt").read_text(), "name,value\nAlpha,42\n")
+
     async def test_zip_inventory_no_unsafe_member_extraction(self):
         archive = self.path / "research.zip"
         with zipfile.ZipFile(archive, "w") as zf:
