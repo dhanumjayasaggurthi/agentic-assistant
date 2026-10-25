@@ -22,7 +22,7 @@ for (let i = 0; i < 100; i++) {
   assert.equal(chart.data.datasets[0].data[1], 17000);
   assert.equal(chart.data.labels[0], 'Dev');
 }
-assert.equal(visuals.parseChart('{bad json}', 'chart'), null);
+assert.throws(() => visuals.parseChart('{bad json}', 'chart'), /invalid JSON/);
 assert.equal(visuals.parseChart('{"type":"widget"}', 'chart'), null);
 assert.throws(() => visuals.parseChart(JSON.stringify({
   type: 'bar', data: { labels: Array(501).fill('x'), datasets: [{data: Array(501).fill(1)}] },
