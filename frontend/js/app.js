@@ -490,6 +490,33 @@ function ActivityPanel({ events = [], live = false, run = null }) {
   );
 }
 
+/* Workspace images are private; resolve them with authenticated fetch, not
+ * a publicly mounted /images URL or bearer tokens in the URL query. */
+function WorkspaceImage({ image, conversationId }) {
+  const [src, setSrc] = useState(image.content
+    ? `data:${image.type || 'image/png'};base64,${image.content}` : null);
+  const [error, setError] = useState('');
+  useEffect(() => {
+    if (image.content) {
+      setSrc(`data:${image.type || 'image/png'};base64,${image.content}`);
+      return;
+    }
+    if (!image.path || !conversationId) return;
+    let disposed = false;
+    let localUrl;
+    RdiRichContent.fetchWorkspaceImage(image.path, conversationId, Auth.authHeaders())
+      .then(blob => {
+        if (disposed) return;
+        localUrl = URL.createObjectURL(blob);
+        setSrc(localUrl);
+      }).catch(err => { if (!disposed) setError(err.message); });
+    return () => { disposed = true; if (localUrl) URL.revokeObjectURL(localUrl); };
+  }, [image.content, image.path, image.type, conversationId]);
+  if (error) return <span className="rich-error">{image.name}: {error}</span>;
+  return src ? <img src={src} alt={image.name || 'Generated visual'} />
+             : <span className="msg-pending">Loading image…</span>;
+}
+
 /* ── Message ───────────────────────────────────────────────────────────────── */
 
 function Message({ msg, onSpeak, onImageClick, streaming, conversationId }) {
@@ -522,6 +549,24 @@ function Message({ msg, onSpeak, onImageClick, streaming, conversationId }) {
   }
 
   const images = (msg.attachments || []).filter(a => (a.type || '').startsWith('image'));
+  const resolveImage = async image => {
+    if (image.content) return image;
+    const blob = await RdiRichContent.fetchWorkspaceImage(
+      image.path, conversationId, Auth.authHeaders());
+    const encoded = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onerror = () => reject(new Error('Cannot open generated image'));
+      reader.onload = () => resolve(reader.result.split(',')[1]);
+      reader.readAsDataURL(blob);
+    });
+    return { ...image, content: encoded };
+  };
+  const imageOperation = (image, action) => {
+    resolveImage(image).then(resolved => {
+      if (action === 'copy') return RdiRichContent.copyImage(resolved.content, resolved.type);
+      onImageClick(resolved, action);
+    }).catch(err => alert('Image unavailable: ' + err.message));
+  };
   return (
     <div className="msg-ai">
       <div className="msg-ai-head">
@@ -534,17 +579,16 @@ function Message({ msg, onSpeak, onImageClick, streaming, conversationId }) {
       {images.length > 0 && (
         <div className={'img-grid ' + (images.length === 1 ? 'g1' : images.length === 2 ? 'g2' : '')} style={{ marginBottom: 14 }}>
           {images.map((a, i) => (
-            <div className="img-cell" key={i} onClick={() => onImageClick(a)}>
-              <img src={`data:${a.type || 'image/png'};base64,${a.content}`} alt={a.name} />
+            <div className="img-cell" key={i} onClick={() => imageOperation(a)}>
+              <WorkspaceImage image={a} conversationId={conversationId} />
               <div className="img-cell-bar">
                 <span className="lbl">{a.name}</span>
                 <button onClick={async e => {
                   e.stopPropagation();
-                  try { await RdiRichContent.copyImage(a.content, a.type || 'image/png'); }
-                  catch (err) { alert('Cannot copy image: ' + err.message); }
+                  imageOperation(a, 'copy');
                 }}>copy image</button>
-                <button onClick={e => { e.stopPropagation(); onImageClick(a, 'edit'); }}>edit</button>
-                <button onClick={e => { e.stopPropagation(); onImageClick(a, 'vary'); }}>vary</button>
+                <button onClick={e => { e.stopPropagation(); imageOperation(a, 'edit'); }}>edit</button>
+                <button onClick={e => { e.stopPropagation(); imageOperation(a, 'vary'); }}>vary</button>
               </div>
             </div>
           ))}
@@ -819,7 +863,7 @@ function ChatView(props) {
             ))}
             {(busy || streamText || streamRun) && (
               <Message msg={{ role: 'assistant', content: streamText, run: streamRun,
-                              activity, meta: modelName(model) }}
+                              activity, attachments: props.streamImages, meta: modelName(model) }}
                        conversationId={conv}
                        onSpeak={speak} onImageClick={props.onImageClick} streaming={busy} />
             )}
@@ -1205,6 +1249,7 @@ function App() {
   const [messages, setMessages] = useState([]);
   const [streamText, setStreamText] = useState('');
   const [streamRun, setStreamRun] = useState(null);
+  const [streamImages, setStreamImages] = useState([]);
   const [activity, setActivity] = useState([]);
   const [busy, setBusy] = useState(false);
   const [model, setModel] = useState(localStorage.getItem('rdi_model') || 'gpt-4.1-global');
@@ -1230,6 +1275,7 @@ function App() {
 
   const streamRef = useRef('');
   const runRef = useRef(null);
+  const streamImagesRef = useRef([]);
   const activityRef = useRef([]);
   const pendingRequestRef = useRef(null);
   const loadTargetRef = useRef(null);
@@ -1300,6 +1346,8 @@ function App() {
       })));
       streamRef.current = d.partial_text || '';
       setStreamText(streamRef.current);
+      streamImagesRef.current = [];
+      setStreamImages([]);
       activityRef.current = d.activity_log || [];
       setActivity(activityRef.current);
       runRef.current = d.running && d.last_run ? { steps: d.last_run.steps || [] } : null;
@@ -1338,7 +1386,7 @@ function App() {
     });
     RdiWS.on('error', d => {
       if (d.request_id && d.request_id !== pendingRequestRef.current) return;
-      if (streamRef.current || runRef.current) finalizeStream();
+      if (streamRef.current || runRef.current || streamImagesRef.current.length) finalizeStream();
       busyRef.current = false;
       pendingRequestRef.current = null;
       setBusy(false);
@@ -1382,7 +1430,7 @@ function App() {
       setBusy(false);
     });
     RdiWS.on('cancelled', d => {
-      if (streamRef.current || runRef.current) finalizeStream();
+      if (streamRef.current || runRef.current || streamImagesRef.current.length) finalizeStream();
       busyRef.current = false;
       pendingRequestRef.current = null;
       setBusy(false);
@@ -1406,6 +1454,12 @@ function App() {
 
     RdiWS.on('image_result', d => {
       const name = d.filename || `generated_${Date.now()}.png`;
+      if (d.from_agent && d.base64) {
+        streamImagesRef.current = [...streamImagesRef.current,
+          { name, type: 'image/png', content: d.base64 }];
+        setStreamImages(streamImagesRef.current);
+        return;
+      }
       if (d.base64) {
         setMessages(ms => [...ms, {
           role: 'assistant',
@@ -1454,13 +1508,15 @@ function App() {
   const finalizeStream = () => {
     const text = streamRef.current;
     const run = runRef.current;
-    if (text || run) {
+    if (text || run || streamImagesRef.current.length) {
       setMessages(ms => [...ms, {
         role: 'assistant', content: text, run, activity: activityRef.current,
+        attachments: streamImagesRef.current,
         meta: modelName(modelRef.current),
       }]);
     }
     streamRef.current = ''; setStreamText('');
+    streamImagesRef.current = []; setStreamImages([]);
     runRef.current = null; setStreamRun(null);
     activityRef.current = []; setActivity([]);
     setPermission(null);
@@ -1491,6 +1547,7 @@ function App() {
     setConvId(null); setConvTitle(''); setMessages([]);
     streamRef.current = ''; setStreamText('');
     runRef.current = null; setStreamRun(null);
+    streamImagesRef.current = []; setStreamImages([]);
     activityRef.current = []; setActivity([]);
     setBusy(false); setPermission(null); setArtifacts([]);
     setCrossChat(false); setFallback(null);
@@ -1556,6 +1613,7 @@ function App() {
     setBusy(true);
     streamRef.current = ''; setStreamText('');
     runRef.current = null; setStreamRun(null);
+    streamImagesRef.current = []; setStreamImages([]);
     activityRef.current = []; setActivity([]);
     setFallback(null);
     if (imgMode) {
@@ -1774,6 +1832,7 @@ function App() {
 
               <ChatView
                 conv={convId} messages={messages} streamText={streamText} streamRun={streamRun}
+                streamImages={streamImages}
                 busy={busy} activity={activity} user={user} agentMode={agentMode} setAgentMode={setAgentMode}
                 model={model} connState={conn}
                 recent={convs} onOpenConv={openConv}
