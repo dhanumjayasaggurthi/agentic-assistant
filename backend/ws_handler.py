@@ -25,6 +25,7 @@ Robustness layer (2026-07-12 redesign — "never break mid-run"):
 import asyncio
 import base64
 import json
+import logging
 import time
 import uuid
 from collections import deque
@@ -113,6 +114,7 @@ class StreamState:
 
 _STREAMS: Dict[str, StreamState] = {}
 _PERM_INDEX: Dict[str, str] = {}  # request_id -> stream key
+_logger = logging.getLogger(__name__)
 
 
 def _stream_key(user_id: str, conv_id: str) -> str:
@@ -237,12 +239,34 @@ class WSSession:
 
     # ── Message router ────────────────────────────────────────────────────────
 
+    async def _run_request(self, handler, data: dict) -> None:
+        current = asyncio.current_task()
+        try:
+            await handler(data)
+        except asyncio.CancelledError:
+            pass  # Stop has already acknowledged cancellation.
+        except Exception:
+            _logger.exception("Chat request failed")
+            active = [st for st in _STREAMS.values() if st.task is current]
+            if active:
+                for st in active:
+                    await st.emit({"type": "error", "message": "Request failed. Check server logs."})
+            else:
+                await self.send({"type": "error", "request_id": data.get("request_id"),
+                                 "message": "Request failed. Check server logs."})
+        finally:
+            for st in _STREAMS.values():
+                if st.task is current:
+                    st.running = False
+                    st.task = None
+                    await st.emit({"type": "activity_done"})
+
     async def handle(self, data: dict) -> None:
         t = data.get("type", "")
         if t in ("chat", "generate_image", "edit_image"):
             handler = {"chat": self._handle_chat, "generate_image": self._handle_image,
                        "edit_image": self._handle_edit_image}[t]
-            task = asyncio.create_task(handler(data))
+            task = asyncio.create_task(self._run_request(handler, data))
             request_id = data.get("request_id")
             if request_id:
                 self._pending_tasks[request_id] = task
