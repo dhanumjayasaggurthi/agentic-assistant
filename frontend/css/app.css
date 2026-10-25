@@ -261,6 +261,38 @@ button { font-family: var(--font-ui); }
   padding: 3px 8px; margin: 0 6px 8px 0;
 }
 .msg-att .ok-sq { color: var(--ok); }
+
+/* Accessible user Markdown and compact, collapsible response progress. */
+.msg-user-content { min-width: 0; overflow-wrap: anywhere; }
+.msg-user-content > :first-child { margin-top: 0; }
+.msg-user-content > :last-child { margin-bottom: 0; }
+.msg-user-content p { margin: 0 0 10px; }
+.msg-user-content ul, .msg-user-content ol { padding-left: 22px; margin: 6px 0 10px; }
+.msg-user-content pre { overflow-x: auto; max-width: 100%; padding: 10px; background: var(--surface); border-radius: 7px; }
+.msg-user-content code { overflow-wrap: anywhere; font-family: var(--font-mono); }
+.msg-user-content blockquote { margin: 8px 0; padding-left: 12px; border-left: 2px solid var(--line2); }
+.msg-user-content table { display: block; overflow-x: auto; max-width: 100%; border-collapse: collapse; }
+.msg-user-content td, .msg-user-content th { padding: 4px 7px; border: 1px solid var(--line); }
+.msg-user-content img { max-width: 100%; height: auto; }
+.msg-user-content h1, .msg-user-content h2, .msg-user-content h3 { font-size: 1.05em; margin: 10px 0 6px; }
+.activity-panel { margin: 0 0 14px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); overflow: hidden; }
+.activity-toggle { display: flex; align-items: center; gap: 9px; width: 100%; padding: 10px 12px;
+  background: none; border: none; color: var(--ink2); text-align: left; font: inherit; font-size: 12.5px; cursor: pointer; }
+.activity-toggle:hover { background: var(--surface2); }
+.activity-toggle:focus-visible { outline: 2px solid var(--red); outline-offset: -2px; }
+.activity-summary { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.activity-toggle-hint { color: var(--ink3); font-size: 11px; flex-shrink: 0; }
+.activity-toggle[aria-expanded="true"] > svg { transform: rotate(180deg); }
+.activity-pulse { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--ok);
+  flex-shrink: 0; animation: runPulse 1.15s ease-in-out infinite; }
+.activity-details { padding: 4px 12px 10px 25px; border-top: 1px solid var(--line);
+  max-height: 260px; overflow-y: auto; font-size: 12px; color: var(--ink2); }
+.activity-entry { display: flex; gap: 9px; align-items: flex-start; margin-top: 7px; overflow-wrap: anywhere; }
+.activity-entry > :first-child { flex-shrink: 0; }
+.activity-still-running { display: block; margin-top: 9px; color: var(--ink3); font-size: 11px; }
+.msg-pending { color: var(--ink3); font-size: 13px; }
+.msg-markdown { display: inline; }
+@media (prefers-reduced-motion: reduce) { .activity-pulse, .stream-caret { animation: none; } }
 .msg-ai { margin-bottom: 26px; }
 .msg-ai-head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 10px; }
 .msg-ai-star { color: var(--red); font-size: 15px; line-height: 1; }
@@ -811,3 +843,55 @@ code[class*="language-"], pre[class*="language-"] {
   .convs { display: none; }
   .main-col { min-width: 0; }
 }
+
+
+/* Rich visual blocks remain readable, printable and directly copyable. */
+.rich-figure { margin: 14px 0 22px; border: 1px solid var(--line); background: var(--surface);
+  border-radius: 12px; overflow: hidden; break-inside: avoid; }
+.rich-graphic { min-height: 60px; padding: 16px; overflow-x: auto; text-align: center; }
+.rich-graphic svg { max-width: 100%; height: auto; }
+.rich-chart { position: relative; width: 100%; height: min(420px, 60vh); min-height: 230px; }
+.rich-toolbar { display: flex; gap: 12px; align-items: center; padding: 7px 12px;
+  border-top: 1px solid var(--line); }
+.rich-source { color: var(--ink3); font-size: 11px; }
+.rich-source summary { cursor: pointer; }
+.rich-source pre { max-width: 100%; overflow-x: auto; margin: 10px 0; }
+.rich-error { color: var(--red); font-size: 12px; text-align: left; }
+.img-cell-bar { gap: 6px; }
+.msg-user-content { white-space: normal; }
+
+/* Browser Save as PDF uses the same rendered SVG, canvases, tables and images. */
+@page { size: A4; margin: 17mm 14mm; }
+@media print {
+  html, body, #root { width: 100% !important; height: auto !important; overflow: visible !important;
+    background: white !important; color: #161616 !important; }
+  .red-hairline, .rail, .convs, .topbar, .composer-wrap, .run-rail, .conn-banner,
+  .msg-actions, .activity-panel, .img-cell-bar, .rich-toolbar, .toasts,
+  .model-palette, .modal-overlay { display: none !important; }
+  .app-frame, .main-col, .chat-scroll, .chat-inner { display: block !important;
+    width: 100% !important; max-width: none !important; min-width: 0 !important;
+    height: auto !important; min-height: 0 !important; overflow: visible !important;
+    padding: 0 !important; margin: 0 !important; box-shadow: none !important; }
+  .msg-user-bubble { background: #f4f4f4 !important; border: 1px solid #ddd !important;
+    max-width: 95% !important; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  .msg-ai, .msg-user, .rich-figure, .msg-body pre, .img-cell { break-inside: avoid-page; }
+  .msg-body { overflow: visible !important; }
+  .rich-figure { border: 1px solid #ddd !important; }
+  .rich-graphic { overflow: visible !important; }
+  .rich-chart { height: 320px !important; }
+  .rich-graphic svg, .img-cell img { max-height: 250mm !important; max-width: 100% !important; }
+  .chat-inner { font-size: 11pt; }
+}
+
+/* File-drop state: visible without blocking native drop handlers. */
+.file-drop-indicator {
+  position: fixed; z-index: 3000; inset: 12px;
+  display: flex; align-items: center; justify-content: center;
+  pointer-events: none; border: 3px dashed var(--ok);
+  border-radius: 14px; background: rgba(80, 150, 105, .11);
+  color: var(--ink); font-size: 18px; font-weight: 600;
+  backdrop-filter: blur(2px);
+}
+.att-chip.failed { max-width: min(100%, 650px); overflow-wrap: anywhere; }
+.att-chip.done { max-width: min(100%, 650px); overflow-wrap: anywhere; }
+@media print { .file-drop-indicator { display: none !important; } }

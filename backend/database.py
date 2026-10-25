@@ -154,7 +154,6 @@ CREATE TABLE IF NOT EXISTS attachments (
     size_bytes      BIGINT DEFAULT 0,
     created_at      TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_attachments_user ON attachments (user_id, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS usage_events (
     id              TEXT PRIMARY KEY,
@@ -266,10 +265,7 @@ async def init_db() -> None:
     async with _pg_pool.acquire() as conn:
         await conn.execute(_SCHEMA)
         for sql in _MIGRATIONS:
-            try:
-                await conn.execute(sql)
-            except Exception:
-                pass
+            await conn.execute(sql)
         # pgvector is expected. Degrade visibly (vector_available()) if absent.
         try:
             await conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
@@ -472,6 +468,11 @@ async def save_attachment(conv_id: str, filename: str, content_type: str,
                           storage_path: str = None, size_bytes: int = 0,
                           attachment_id: str = None) -> str:
     aid, now = attachment_id or str(uuid.uuid4()), _now()
+    # PostgreSQL TEXT cannot contain NUL (U+0000). The binary original is
+    # stored separately; legacy callers may supply actual extracted text.
+    if not isinstance(content, str):
+        raise TypeError("Attachment content must be Unicode text; store binary on disk")
+    content = content.replace("\x00", "\ufffd")
     async with _pool().acquire() as conn:
         await conn.execute(
             "INSERT INTO attachments (id,user_id,conversation_id,message_id,filename,"

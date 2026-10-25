@@ -25,6 +25,7 @@ Robustness layer (2026-07-12 redesign — "never break mid-run"):
 import asyncio
 import base64
 import json
+import logging
 import time
 import uuid
 from collections import deque
@@ -53,7 +54,7 @@ from .telemetry import emit as telemetry_emit
 
 # Activity icons per tool
 _TOOL_ICONS: Dict[str, str] = {
-    "read_file": "📄", "write_file": "✏️", "create_file": "📝",
+    "read_file": "📄", "file_overview": "📊", "write_file": "✏️", "create_file": "📝",
     "patch_file": "🩹", "inspect_image": "👁️", "delegate_code": "🧠",
     "delete_file": "🗑️", "list_files": "📁", "run_bash": "⚡",
     "run_python": "🐍", "search_files": "🔍", "create_pdf": "📑",
@@ -62,7 +63,7 @@ _TOOL_ICONS: Dict[str, str] = {
 }
 
 # Tools that never mutate anything — eligible for auto-approval.
-READONLY_TOOLS = {"read_file", "list_files", "search_files", "web_search", "web_crawl", "inspect_image"}
+READONLY_TOOLS = {"read_file", "file_overview", "list_files", "search_files", "web_search", "web_crawl", "inspect_image"}
 
 # Tools that produce files — their outputs get registered as artifacts.
 FILE_TOOLS = {"write_file", "create_file", "patch_file", "create_pdf", "create_pptx",
@@ -84,26 +85,34 @@ class StreamState:
         self.key = key
         self.seq = 0
         self.buffer: deque = deque(maxlen=_BUFFER_SIZE)
+        self.partial_text = ""  # full active turn, not the bounded replay buffer
         self.session: Optional["WSSession"] = None
         self.running = False
         self.run_id: Optional[str] = None
         self.perm_events: Dict[str, asyncio.Event] = {}
         self.perm_decisions: Dict[str, str] = {}
         self.auto_allow_readonly = False
+        self.auto_allow_tools: set[str] = set()
         self.task: Optional[asyncio.Task] = None
+        self._emit_lock = asyncio.Lock()
 
     async def emit(self, data: dict) -> None:
-        self.seq += 1
-        data["seq"] = self.seq
-        self.buffer.append(data)
-        sess = self.session
-        if sess is not None:
-            try:
-                await sess.ws.send_json(data)
-            except Exception:
-                # Socket is gone — detach; the run continues and buffers.
-                if self.session is sess:
-                    self.session = None
+        # Serialize live sends with reconnect replay so tokens never arrive
+        # out of order or overtake an older replayed chunk.
+        async with self._emit_lock:
+            data = {**data, "conversation_id": self.key.split(":", 1)[1]}
+            self.seq += 1
+            data["seq"] = self.seq
+            self.buffer.append(data)
+            if data.get("type") == "token":
+                self.partial_text += data.get("text", "")
+            sess = self.session
+            if sess is not None:
+                try:
+                    await sess.ws.send_json(data)
+                except Exception:
+                    if self.session is sess:
+                        self.session = None
 
     def replay_after(self, last_seq: int) -> List[dict]:
         return [e for e in self.buffer if e.get("seq", 0) > last_seq]
@@ -111,6 +120,9 @@ class StreamState:
 
 _STREAMS: Dict[str, StreamState] = {}
 _PERM_INDEX: Dict[str, str] = {}  # request_id -> stream key
+_PERM_TOOL_INDEX: Dict[str, str] = {}  # tool name for approved permission prompt
+_PERMISSION_TIMEOUT_SECONDS = 30 * 60
+_logger = logging.getLogger(__name__)
 
 
 def _stream_key(user_id: str, conv_id: str) -> str:
@@ -137,6 +149,7 @@ class WSSession:
         self.model: str = "gpt-4o-global"
         self.history: List[Dict] = []
         self.auto_allow_readonly: bool = False
+        self._pending_tasks: Dict[str, asyncio.Task] = {}
         # Workspace settings cache (loaded lazily from DB)
         self._workspace_mode: Optional[str] = None
         self._workspace_custom_path: Optional[str] = None
@@ -193,15 +206,31 @@ class WSSession:
                 "size": row.get("size_bytes") or ref.get("size") or 0,
                 "storage_path": row.get("storage_path"),
             }
+            storage_path = row.get("storage_path")
+            base = self._ws_base().resolve()
+            original = (base / storage_path).resolve() if storage_path else None
+            authorized = original is not None and original.is_file() and original.is_relative_to(base)
             if content_type.startswith("image/"):
-                storage_path = row.get("storage_path")
-                if storage_path:
-                    p = (self._ws_base() / storage_path).resolve()
-                    base = self._ws_base().resolve()
-                    if p.is_file() and (p == base or p.is_relative_to(base)):
-                        item["content"] = base64.b64encode(p.read_bytes()).decode()
+                if authorized:
+                    item["content"] = base64.b64encode(original.read_bytes()).decode()
             else:
-                item["content"] = row.get("content") or ""
+                # Most legacy attachments kept text in the DB. Modern uploads
+                # have full extracted UTF-8 sidecars, with original bytes intact.
+                sidecar = original.parent / "extracted.txt" if authorized else None
+                manifest = original.parent / "manifest.json" if authorized else None
+                if manifest and manifest.is_file():
+                    try:
+                        item["extraction"] = json.loads(manifest.read_text(encoding="utf-8"))
+                    except (ValueError, OSError):
+                        item["extraction"] = {"complete": False, "note": "Extraction metadata unavailable"}
+                if sidecar and sidecar.is_file():
+                    item["extracted_path"] = str(sidecar)
+                    if sidecar.stat().st_size <= 12_000:
+                        item["content"] = sidecar.read_text(encoding="utf-8")
+                    else:
+                        item["content"] = ""
+                else:
+                    item["content"] = row.get("content") or ""
             hydrated.append(item)
         return hydrated
 
@@ -234,12 +263,41 @@ class WSSession:
 
     # ── Message router ────────────────────────────────────────────────────────
 
+    async def _run_request(self, handler, data: dict) -> None:
+        current = asyncio.current_task()
+        try:
+            await handler(data)
+        except asyncio.CancelledError:
+            pass  # Stop has already acknowledged cancellation.
+        except Exception:
+            _logger.exception("Chat request failed")
+            active = [st for st in _STREAMS.values() if st.task is current]
+            if active:
+                for st in active:
+                    await st.emit({"type": "error", "message": "Request failed. Check server logs."})
+            else:
+                await self.send({"type": "error", "request_id": data.get("request_id"),
+                                 "message": "Request failed. Check server logs."})
+        finally:
+            for st in _STREAMS.values():
+                if st.task is current:
+                    st.running = False
+                    st.task = None
+                    await st.emit({"type": "activity_done"})
+
     async def handle(self, data: dict) -> None:
         t = data.get("type", "")
-        if t == "chat":
-            task = asyncio.create_task(self._handle_chat(data))
-            # The task is attached to the conversation stream once the
-            # conversation id is resolved inside _handle_chat.
+        if t in ("chat", "generate_image", "edit_image"):
+            handler = {"chat": self._handle_chat, "generate_image": self._handle_image,
+                       "edit_image": self._handle_edit_image}[t]
+            task = asyncio.create_task(self._run_request(handler, data))
+            request_id = data.get("request_id")
+            if request_id:
+                self._pending_tasks[request_id] = task
+                task.add_done_callback(
+                    lambda finished, rid=request_id: self._pending_tasks.pop(rid, None)
+                    if self._pending_tasks.get(rid) is finished else None
+                )
         elif t == "stop":
             await self._handle_stop(data)
         elif t == "permission":
@@ -263,10 +321,6 @@ class WSSession:
             await self._handle_list_conversations()
         elif t == "set_model":
             self.model = data.get("model", self.model)
-        elif t == "generate_image":
-            asyncio.create_task(self._handle_image(data))
-        elif t == "edit_image":
-            asyncio.create_task(self._handle_edit_image(data))
         elif t == "tts":
             asyncio.create_task(self._handle_tts(data))
         elif t == "transcribe":
@@ -316,23 +370,35 @@ class WSSession:
                 "current_seq": 0, "last_run": run,
             })
             return
-        st.session = self
-        replay = st.replay_after(last_seq)
-        await self.send({
-            "type": "resume_ok",
-            "running": st.running,
-            "replayed": len(replay),
-            "current_seq": st.seq,
-        })
-        for ev in replay:
-            try:
-                await self.ws.send_json(ev)
-            except Exception:
-                st.session = None
-                return
+        async with st._emit_lock:
+            st.session = self
+            # A bounded event replay may have rolled over: never silently
+            # present only the last N tokens as though they were the full answer.
+            gap = bool(st.buffer and last_seq < st.buffer[0].get("seq", 1) - 1)
+            replay = [] if gap else st.replay_after(last_seq)
+            await self.send({
+                "type": "resume_ok", "conversation_id": cid,
+                "running": st.running,
+                "replayed": len(replay),
+                "current_seq": st.seq,
+                "snapshot": st.partial_text if gap and st.running else None,
+                "reload_required": bool(gap and not st.running),
+            })
+            for ev in replay:
+                try:
+                    await self.ws.send_json(ev)
+                except Exception:
+                    st.session = None
+                    return
 
     async def _handle_stop(self, data: dict) -> None:
-        cid = data.get("conversation_id") or self.conversation_id
+        request_id = data.get("request_id")
+        pending = self._pending_tasks.get(request_id) if request_id else None
+        if pending and not pending.done():
+            pending.cancel()
+        # Explicit null means a not-yet-created conversation: never stop a
+        # different chat held in session.conversation_id.
+        cid = data.get("conversation_id") if "conversation_id" in data else self.conversation_id
         if not cid:
             return
         st = _STREAMS.get(_stream_key(self.user["id"], cid))
@@ -342,6 +408,13 @@ class WSSession:
         st.running = False
         if task and not task.done():
             task.cancel()
+        st.task = None
+        for permission_id, event in list(st.perm_events.items()):
+            _PERM_INDEX.pop(permission_id, None)
+            _PERM_TOOL_INDEX.pop(permission_id, None)
+            st.perm_events.pop(permission_id, None)
+            event.set()
+        st.perm_decisions.clear()
         await st.emit({"type": "cancelled", "message": "Run stopped by user."})
         await st.emit({"type": "activity_done"})
 
@@ -380,6 +453,11 @@ class WSSession:
         if st is not None:
             st.session = self
         run = await get_latest_run(cid)
+        partial_text = st.partial_text if st and st.running else ""
+        activity_log = [
+            {"action": ev.get("action", "Working…"), "icon": ev.get("icon", "·")}
+            for ev in st.buffer if ev.get("type") == "activity"
+        ][-16:] if st and st.running else []
         await self.send({
             "type": "conversation_loaded",
             "conversation": conv,
@@ -387,6 +465,8 @@ class WSSession:
             "cross_chat_reference": self.cross_chat_reference,
             "running": bool(st.running) if st else False,
             "current_seq": st.seq if st else 0,
+            "partial_text": partial_text,
+            "activity_log": activity_log,
             "last_run": run,
         })
 
@@ -400,6 +480,21 @@ class WSSession:
 
     async def _handle_delete_conversation(self, data: dict) -> None:
         cid = data.get("conversation_id")
+        if not await get_conversation(cid, self.user["id"]):
+            await self.send_error("Conversation not found")
+            return
+        st = _STREAMS.get(_stream_key(self.user["id"], cid))
+        if st and st.running:
+            task = st.task
+            await self._handle_stop({"conversation_id": cid})
+            if task and not task.done():
+                try:
+                    await asyncio.wait_for(asyncio.shield(task), timeout=3)
+                except asyncio.CancelledError:
+                    pass
+                except asyncio.TimeoutError:
+                    await self.send_error("Run is still stopping; retry deletion after it exits.")
+                    return
         deleted = await delete_conversation(cid, self.user["id"])
         if not deleted:
             await self.send_error("Conversation not found")
@@ -474,7 +569,7 @@ class WSSession:
     async def _handle_chat(self, data: dict) -> None:
         user_msg = data.get("message", "").strip()
         model = data.get("model", self.model)
-        cid = data.get("conversation_id") or self.conversation_id
+        cid = data.get("conversation_id") if "conversation_id" in data else self.conversation_id
         attachments = data.get("attachments", [])
 
         if not user_msg and not attachments:
@@ -487,7 +582,8 @@ class WSSession:
             conv = await create_conversation(self.user["id"], model)
             cid = conv["id"]
             self.conversation_id = cid
-            await self.send({"type": "conversation_created", "id": cid, "conversation": conv})
+            await self.send({"type": "conversation_created", "id": cid, "conversation": conv,
+                             "request_id": data.get("request_id")})
         else:
             owned = await get_conversation(cid, self.user["id"])
             if not owned:
@@ -496,7 +592,21 @@ class WSSession:
             await update_conversation_meta(cid, model=model)
 
         st = self._attach_stream(cid)
+        if st.running and st.task is not asyncio.current_task():
+            await self.send({"type": "request_rejected",
+                             "message": "This conversation already has an active response."})
+            return
         st.task = asyncio.current_task()
+        st.running = True
+        st.partial_text = ""
+
+        # History belongs to this conversation, never to a mutable WebSocket session.
+        previous = await get_messages(cid)
+        history = trim_history([
+            {"role": m["role"], "content": m["content"],
+             "attachments": m.get("attachments") or []}
+            for m in previous
+        ])
 
         norm_atts = _normalize_attachments(attachments)
         attachment_ids = [
@@ -510,22 +620,33 @@ class WSSession:
         # Persist only handles/metadata; never persist another duplicate copy in
         # the message JSON when the attachment service already owns the content.
         await add_message(cid, "user", user_msg, attachments=norm_atts or None)
-        if len(self.history) == 0:
+        if not previous:
             await auto_title(cid, user_msg)
-
-        self.history.append({"role": "user", "content": user_msg, "attachments": norm_atts})
-        self.history = trim_history(self.history)
 
         agent_mode = bool(data.get("agent_mode", False))
         auto_agent = bool(data.get("auto_agent", True))
-        if not agent_mode and auto_agent and _should_auto_agent(user_msg, model_atts):
+        # Reading substantial documents requires file tools regardless of the
+        # UI's Chat/Agent selection. Keep the selected model when tool-capable;
+        # report any necessary orchestrator fallback to the user.
+        has_documents = any(not (a.get("type") or "").startswith("image/")
+                            for a in model_atts)
+        prior_documents = any(
+            (a.get("type") or a.get("content_type") or "").startswith(("text/", "application/"))
+            or not (a.get("type") or a.get("content_type") or "").startswith("image/")
+            for m in history if m.get("role") == "user"
+            for a in m.get("attachments") or [] if isinstance(a, dict)
+        )
+        long_context = sum(len(str(m.get("content", ""))) for m in history) > 100_000
+        if not agent_mode and (has_documents or prior_documents or long_context or
+                               (auto_agent and _should_auto_agent(user_msg, model_atts))):
             agent_mode = True
             await st.emit({
                 "type": "auto_agent_started",
-                "reason": "This request requires tools or workspace actions, so it was promoted to an agent run.",
+                "reason": "Analyzing complete attachments using paginated tools; originals are retained.",
             })
         if agent_mode:
-            await self._run_coding_agent(user_msg, model, cid, st, attachments=model_atts)
+            await self._run_coding_agent(user_msg, model, cid, st,
+                                         attachments=model_atts, history=history)
             return
 
         # ── Plain chat ────────────────────────────────────────────────────────
@@ -534,26 +655,34 @@ class WSSession:
         await st.emit({"type": "activity", "action": "Connecting to model…", "icon": "🔗"})
 
         sys_prefix = await self._cross_chat_prefix(cid)
-        hydrated_history = await self._hydrate_history(self.history[:-1])
+        hydrated_history = await self._hydrate_history(history)
         messages = build_messages(hydrated_history, user_msg, model_atts or None,
                                   system_prefix=sys_prefix)
         full_response = ""
         try:
             await st.emit({"type": "activity", "action": "Streaming response…", "icon": "💬"})
             full_response = await self._stream_with_retry(st, messages, model)
+        except asyncio.CancelledError:
+            # Keep actually generated partial text when a user presses Stop.
+            partial = st.partial_text
+            if partial:
+                await add_message(cid, "assistant", partial)
+            st.running = False
+            st.task = None
+            return
         except Exception as exc:
             st.running = False
+            st.task = None
             await st.emit({"type": "error", "message": f"Model error: {exc}"})
             await st.emit({"type": "activity_done"})
             return
 
         latency = int((time.time() - t0) * 1000)
+        await add_message(cid, "assistant", full_response)
+        st.running = False
+        st.task = None
         await st.emit({"type": "done", "latency_ms": latency})
         await st.emit({"type": "activity_done"})
-        st.running = False
-
-        await add_message(cid, "assistant", full_response)
-        self.history.append({"role": "assistant", "content": full_response})
 
         input_chars = sum(len(str(m.get("content", ""))) for m in messages)
         await record_usage(
@@ -588,7 +717,9 @@ class WSSession:
     # ── Cross-chat context builder ────────────────────────────────────────────
 
     async def _cross_chat_prefix(self, cid: str) -> str:
-        if not self.cross_chat_reference:
+        # Never use session-wide state: a newer conversation may already be active.
+        conv = await get_conversation(cid, self.user["id"])
+        if not conv or not conv.get("cross_chat_reference", False):
             return ""
         others = await get_other_conversation_summaries(self.user["id"], cid)
         if not others:
@@ -604,9 +735,11 @@ class WSSession:
     # ── Coding agent (checkpointed run) ───────────────────────────────────────
 
     async def _run_coding_agent(self, user_msg: str, model: str, cid: str,
-                                st: StreamState, attachments: list = None) -> None:
+                                st: StreamState, attachments: list = None,
+                                history: list = None) -> None:
         t0 = time.time()
         full_response = ""
+        generated_images: List[Dict] = []
         await self._load_ws_settings()
         _tok = _workspace_var.set(self._conv_workspace(cid))
 
@@ -651,48 +784,86 @@ class WSSession:
         await st.emit({"type": "run_started", "run_id": run_id,
                        "model": run_model, "requested_model": requested_model})
 
-        # Inject attachment content so the agent can see it
+        # Materialize both original and extracted text; never paste entire file
+        # contents into a single model request or silently omit large sections.
+        import shutil
+        workspace = self._conv_workspace(cid)
         enriched_msg = user_msg
-        atts = _normalize_attachments(attachments)
-        if atts:
-            parts = []
-            for att in atts:
-                name = att.get("name", "file")
-                att_type = att.get("type", "text")
-                content = att.get("content", "")
-                if att_type.startswith("image/") or att_type == "image":
-                    img_path = self._conv_workspace(cid) / "images" / name
-                    img_path.parent.mkdir(parents=True, exist_ok=True)
-                    try:
-                        raw = content.split(",", 1)[1] if content.startswith("data:") else content
-                        img_path.write_bytes(base64.b64decode(raw))
-                        parts.append(f"[Attached image saved to workspace: images/{name}]")
-                    except Exception:
-                        parts.append(f"[Attached image: {name}]")
-                else:
-                    workspace_path = None
-                    storage_path = att.get("storage_path")
-                    if storage_path:
-                        try:
-                            src = (self._ws_base() / storage_path).resolve()
-                            base = self._ws_base().resolve()
-                            if src.is_file() and src.is_relative_to(base):
-                                safe_name = Path(name).name
-                                aid = att.get("attachment_id") or att.get("id") or "attachment"
-                                stored_name = f"{aid[:12]}_{safe_name}"
-                                dst = self._conv_workspace(cid) / "uploads" / stored_name
-                                dst.parent.mkdir(parents=True, exist_ok=True)
-                                dst.write_bytes(src.read_bytes())
-                                workspace_path = f"uploads/{stored_name}"
-                        except Exception:
-                            workspace_path = None
-                    header = (
-                        f"[Attached file materialized at workspace/{workspace_path}]\n"
-                        if workspace_path else ""
-                    )
-                    parts.append(f"{header}--- Attached file: {name} ---\n{content}\n---")
-            if parts:
-                enriched_msg = "\n\n".join(parts) + "\n\n" + user_msg
+        # Already ownership-validated by _hydrate_attachments. Do not run the
+        # client-handle normalizer again (it strips trusted storage_path).
+        atts = [dict(a) for a in (attachments or []) if isinstance(a, dict)]
+        references = []
+        for att in atts:
+            name = Path(att.get("name", "file")).name
+            aid = str(att.get("attachment_id") or att.get("id") or "legacy")
+            content_type = att.get("type") or ""
+            if content_type.startswith("image/") or content_type == "image":
+                img_path = workspace / "images" / name
+                img_path.parent.mkdir(parents=True, exist_ok=True)
+                content = att.get("content") or ""
+                if content:
+                    raw = content.split(",", 1)[1] if content.startswith("data:") else content
+                    await asyncio.to_thread(img_path.write_bytes, base64.b64decode(raw))
+                references.append(f"- Image: images/{name} (inspect_image tool)")
+                continue
+
+            rel = att.get("storage_path")
+            extracted_path = att.get("extracted_path")
+            destination = None
+            if rel:
+                base = self._ws_base().resolve()
+                source = (base / rel).resolve()
+                if source.is_file() and source.is_relative_to(base):
+                    safe_filename = f"{aid[:12]}_{name}"
+                    original_target = workspace / "uploads" / safe_filename
+                    original_target.parent.mkdir(parents=True, exist_ok=True)
+                    await asyncio.to_thread(shutil.copy2, source, original_target)
+                    destination = original_target.relative_to(workspace).as_posix()
+                    sidecar = source.parent / "extracted.txt"
+                    if sidecar.is_file():
+                        text_target = workspace / "uploads" / (safe_filename + ".extracted.txt")
+                        await asyncio.to_thread(shutil.copy2, sidecar, text_target)
+                        extracted_path = text_target.relative_to(workspace).as_posix()
+            if not destination and att.get("content"):
+                # Handle historical inline-text uploads without disk originals.
+                text_target = workspace / "uploads" / f"{aid[:12]}_{name}.extracted.txt"
+                text_target.parent.mkdir(parents=True, exist_ok=True)
+                await asyncio.to_thread(
+                    text_target.write_text, att["content"], encoding="utf-8"
+                )
+                extracted_path = text_target.relative_to(workspace).as_posix()
+            status = att.get("extraction") or {}
+            note = status.get("note") or ""
+            references.append(
+                f"- {name}: original={destination or 'not available'}; "
+                f"extracted_text={extracted_path or 'not available'}; "
+                f"extraction_complete={status.get('complete', 'unknown')}; "
+                f"notes={note or 'none'}"
+            )
+        if references:
+            enriched_msg = (
+                "Attached sources are workspace files, NOT inline model context. "
+                "Use file_overview, read_file with successive line ranges, "
+                "search_files, or inspect_image as appropriate. For an entire-file "
+                "request, inspect all relevant sections before concluding, "
+                "and explicitly report what was not inspected. Cite file paths, "
+                "sheet names, rows or page labels. Never invent data.\n"
+                + "\n".join(references) + "\n\nUSER REQUEST:\n" + user_msg
+            )
+
+        # Keep complete older messages retrievable even when the LLM's active
+        # context window only includes recent turns.
+        history_target = workspace / "uploads" / "_conversation_history.txt"
+        full_history = "\n\n".join(
+            f"[{m.get('role','unknown').upper()}]\n{m.get('content','')}"
+            for m in (history or [])
+        )
+        if full_history:
+            await asyncio.to_thread(history_target.write_text, full_history, encoding="utf-8")
+            enriched_msg += (
+                "\n\nPrevious conversation text is accessible in "
+                "uploads/_conversation_history.txt via read_file ranges."
+            )
 
         sys_prefix = await self._cross_chat_prefix(cid)
         if sys_prefix:
@@ -711,8 +882,17 @@ class WSSession:
 
         async def _perm_fn(rid: str, tool: str, args: dict, preview: str) -> bool:
             icon = _TOOL_ICONS.get(tool, "🔧")
-            # Auto-approve read-only tools when the user opted in.
-            if st.auto_allow_readonly and tool in READONLY_TOOLS:
+            # User explicitly supplied the source file. Approve only local,
+            # non-mutating inspection within this conversation's workspace.
+            # Other tools still require the original permission policy.
+            local_file_reads = {"read_file", "file_overview", "search_files", "list_files"}
+            has_user_files = bool(references) or any(
+                m.get("attachments") for m in (history or [])
+                if m.get("role") == "user"
+            )
+            if ((has_user_files and tool in local_file_reads)
+                    or (st.auto_allow_readonly and tool in READONLY_TOOLS)
+                    or tool in st.auto_allow_tools):
                 step = _find_step(rid) or {"rid": rid, "tool": tool}
                 step["permission"] = "auto_allowed"
                 await st.emit({
@@ -724,6 +904,7 @@ class WSSession:
             event = asyncio.Event()
             st.perm_events[rid] = event
             _PERM_INDEX[rid] = st.key
+            _PERM_TOOL_INDEX[rid] = tool
             step = _find_step(rid)
             if step is None:
                 step = {"rid": rid, "tool": tool, "label": _tool_label(tool, args),
@@ -742,11 +923,22 @@ class WSSession:
             })
             await st.emit({"type": "run_step", "run_id": run_id, "steps": _public_steps(steps)})
             await _ckpt("waiting_permission")
-            if rid not in st.perm_decisions:
-                await event.wait()
-            st.perm_events.pop(rid, None)
-            _PERM_INDEX.pop(rid, None)
+            timed_out = False
+            try:
+                if rid not in st.perm_decisions:
+                    try:
+                        await asyncio.wait_for(event.wait(), timeout=_PERMISSION_TIMEOUT_SECONDS)
+                    except asyncio.TimeoutError:
+                        timed_out = True
+            finally:
+                st.perm_events.pop(rid, None)
+                _PERM_INDEX.pop(rid, None)
+                _PERM_TOOL_INDEX.pop(rid, None)
             decision = st.perm_decisions.pop(rid, "deny")
+            if timed_out:
+                decision = "timeout"
+                await st.emit({"type": "permission_timeout", "request_id": rid,
+                               "message": "Permission timed out. Tool not executed; ask to continue."})
             step["permission"] = decision
             step["status"] = "running" if decision == "allow" else "denied"
             await st.emit({"type": "run_step", "run_id": run_id, "steps": _public_steps(steps)})
@@ -816,18 +1008,27 @@ class WSSession:
                 await st.emit({"type": "workspace", "files": get_file_tree()})
 
         async def _image_fn(b64: str, filename: str):
+            # The image tool writes under workspace/images/, not workspace/.
+            safe_name = Path(filename).name
+            relative = f"images/{safe_name}"
             try:
-                ws_dir = self._conv_workspace(cid)
-                fpath = ws_dir / filename
-                if fpath.exists():
-                    await register_artifact(cid, filename, filename, run_id=run_id,
-                                            kind="image", size_bytes=fpath.stat().st_size)
+                fpath = self._conv_workspace(cid) / relative
+                if fpath.is_file():
+                    await register_artifact(
+                        cid, safe_name, relative, run_id=run_id,
+                        kind="image", size_bytes=fpath.stat().st_size
+                    )
+                    # Persist a lightweight reference, never a duplicate base64
+                    # payload in the message database.
+                    generated_images.append({
+                        "name": safe_name, "type": "image/png", "path": relative
+                    })
             except Exception:
-                pass
+                _logger.exception("Failed to register generated image artifact")
             await st.emit({
                 "type": "image_result",
                 "base64": b64,
-                "filename": filename,
+                "filename": safe_name,
                 "from_agent": True,
             })
 
@@ -835,7 +1036,7 @@ class WSSession:
         cancelled = False
         err_text = None
         try:
-            hydrated_history = await self._hydrate_history(self.history[:-1])
+            hydrated_history = await self._hydrate_history((history or []))
             await run_coding_agent(
                 enriched_msg, hydrated_history, run_model,
                 permission_fn=_perm_fn,
@@ -850,7 +1051,6 @@ class WSSession:
         except Exception as exc:
             agent_failed = True
             err_text = str(exc)
-            await st.emit({"type": "error", "message": f"Coding agent error: {exc}"})
         finally:
             _workspace_var.reset(_tok)
 
@@ -858,33 +1058,34 @@ class WSSession:
         st.task = None
         latency = int((time.time() - t0) * 1000)
 
-        input_chars = sum(len(str(m.get("content", ""))) for m in self.history[:-1])
+        input_chars = sum(len(str(m.get("content", ""))) for m in (history or []))
         in_toks = max(1, input_chars // 4)
         out_toks = max(1, len(full_response) // 4)
 
         if cancelled:
-            if full_response:
-                await add_message(cid, "assistant", full_response)
-                self.history.append({"role": "assistant", "content": full_response})
+            if full_response or generated_images:
+                await add_message(cid, "assistant", full_response,
+                                  attachments=generated_images or None)
+
             await finish_run(run_id, "cancelled", in_toks, out_toks, 0.0, error=err_text)
             await st.emit({"type": "run_step", "run_id": run_id,
                            "steps": _public_steps(steps), "final": "cancelled"})
             return
 
         if agent_failed:
-            if full_response:
-                await add_message(cid, "assistant", full_response)
-                self.history.append({"role": "assistant", "content": full_response})
+            if full_response or generated_images:
+                await add_message(cid, "assistant", full_response,
+                                  attachments=generated_images or None)
+
             await finish_run(run_id, "error", in_toks, out_toks, 0.0, error=err_text)
             await st.emit({"type": "run_step", "run_id": run_id,
                            "steps": _public_steps(steps), "final": "error"})
+            await st.emit({"type": "error", "message": f"Coding agent error: {err_text}"})
             await st.emit({"type": "activity_done"})
             return
 
-        await st.emit({"type": "done", "latency_ms": latency})
-        await st.emit({"type": "activity_done"})
-        await add_message(cid, "assistant", full_response)
-        self.history.append({"role": "assistant", "content": full_response})
+        await add_message(cid, "assistant", full_response,
+                          attachments=generated_images or None)
 
         telemetry_emit(
             "agent_run_completed",
@@ -900,18 +1101,25 @@ class WSSession:
         await finish_run(run_id, "done", in_toks, out_toks, 0.0)
         await st.emit({"type": "run_step", "run_id": run_id,
                        "steps": _public_steps(steps), "final": "done"})
+        await st.emit({"type": "done", "latency_ms": latency})
+        await st.emit({"type": "activity_done"})
 
     # ── Permission response ───────────────────────────────────────────────────
 
     async def _handle_permission(self, data: dict) -> None:
         rid = data.get("request_id", "")
         decision = data.get("decision", "deny")
+        always = bool(data.get("always"))
         # Route via the stream index so a decision after reconnect still lands.
         key = _PERM_INDEX.get(rid)
         st = _STREAMS.get(key) if key else None
         if st is None and self.conversation_id:
             st = _STREAMS.get(_stream_key(self.user["id"], self.conversation_id))
         if st is not None:
+            if always and decision == "allow":
+                tool = _PERM_TOOL_INDEX.get(rid)
+                if tool:
+                    st.auto_allow_tools.add(tool)
             st.perm_decisions[rid] = decision
             event = st.perm_events.pop(rid, None)
             if event:
@@ -935,12 +1143,13 @@ class WSSession:
         if doc_context:
             gen_prompt = f"{prompt}\n\nReference context:\n{doc_context}"
 
-        cid = data.get("conversation_id") or self.conversation_id
+        cid = data.get("conversation_id") if "conversation_id" in data else self.conversation_id
         if not cid:
             conv = await create_conversation(self.user["id"], model)
             cid = conv["id"]
             self.conversation_id = cid
-            await self.send({"type": "conversation_created", "id": cid, "conversation": conv})
+            await self.send({"type": "conversation_created", "id": cid, "conversation": conv,
+                             "request_id": data.get("request_id")})
         first_msg = len(await get_messages(cid)) == 0
 
         st = self._attach_stream(cid)

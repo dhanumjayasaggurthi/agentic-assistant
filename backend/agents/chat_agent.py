@@ -30,7 +30,17 @@ def _route(model: str) -> str:
 
 _DEFAULT_SYSTEM = (
     "You are RDI AI, an advanced enterprise AI assistant. "
-    "Be helpful, accurate, and concise. Format responses in Markdown."
+    "Be helpful, accurate, and concise. Format responses in Markdown. "
+    "When diagrams are requested, write valid Mermaid in a fenced mermaid block, "
+    "using simple flowchart LR/TD syntax and quoted labels, such as "
+    "A[\"QI-TEST 17K rows\"] --> B[\"DataHub\"]. "
+    "Avoid raw HTML tags in Mermaid labels, and keep node IDs simple. "
+    "For numeric charts, use strict, complete JSON in a fenced chart block: "
+    "{\"type\":\"bar\",\"data\":{\"labels\":[\"DEV\",\"QI-TEST\"],"
+    "\"datasets\":[{\"label\":\"Rows\",\"data\":[40000,17000]}]}}. "
+    "Only use sourced numbers, never invent values. "
+    "Do not refer to generated image paths unless a tool actually produced the file. "
+    "If output length is insufficient, explicitly say that continuation is needed."
 )
 
 
@@ -74,14 +84,16 @@ def attachments_to_text(
         else:
             content = str(att.get("content", "") or "")
             if len(content) > per_file_chars:
-                content = content[:per_file_chars] + "\n...[attachment truncated]"
+                raise ValueError(
+                    f"Attachment {name!r} exceeds the {per_file_chars:,}-character model context limit. "
+                    "The full file is retained; ask to analyze a specific section or split the request."
+                )
             piece = f"--- Attached file: {name} ---\n{content}\n---"
-        remaining = total_chars - used
-        if remaining <= 0:
-            parts.append("[Additional attachments omitted from model context]")
-            break
-        if len(piece) > remaining:
-            piece = piece[:remaining] + "\n...[attachment context limit reached]"
+        if used + len(piece) > total_chars:
+            raise ValueError(
+                f"Attachment context exceeds {total_chars:,} characters. "
+                "No attachment was silently omitted. Select fewer files or a smaller section."
+            )
         parts.append(piece)
         used += len(piece)
     return "\n\n".join(parts)
@@ -153,18 +165,9 @@ async def stream_response(
 
 
 def trim_history(history: List[Dict], max_chars: int = 180_000) -> List[Dict]:
-    """Sliding window: drop the OLDEST messages first, keeping newest within budget.
+    """Keep the durable transcript unchanged.
 
-    history holds only user/assistant turns (no system message), so we pop from
-    index 0. Attachment content counts toward the budget too."""
-    def _size(m: Dict) -> int:
-        n = len(str(m.get("content", "")))
-        for att in m.get("attachments") or []:
-            n += len(str(att.get("content", "")))
-        return n
-
-    total = sum(_size(m) for m in history)
-    while total > max_chars and len(history) > 1:
-        removed = history.pop(0)
-        total -= _size(removed)
+    LLM context selection is handled at call time. It must never fail the
+    conversation or mutate stored history merely because a file is large.
+    """
     return history

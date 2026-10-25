@@ -3,6 +3,7 @@
 Storage: PostgreSQL + pgvector (REQUIRED — see docker-compose.postgres.yml).
 Startup fails fast with a clear message when the database is not configured.
 """
+import asyncio
 import base64
 import io
 import sys
@@ -242,109 +243,42 @@ async def upload_file(
             pass
         raise
 
-    # Extract bounded textual context once; original bytes remain on disk.
-    content = ""
-    file_type = "image" if content_type.startswith("image/") else "text"
-    if content_type == "application/pdf":
-        try:
-            import PyPDF2
-            reader = PyPDF2.PdfReader(str(disk_path))
-            parts = []
-            total = 0
-            for page in reader.pages:
-                text_part = page.extract_text() or ""
-                remaining = 1_000_000 - total
-                if remaining <= 0:
-                    break
-                parts.append(text_part[:remaining])
-                total += min(len(text_part), remaining)
-            content = "\n".join(parts)
-        except Exception:
-            content = ""
-    elif "word" in content_type or filename.lower().endswith(".docx"):
-        try:
-            from docx import Document
-            doc = Document(str(disk_path))
-            parts, total = [], 0
-            for p in doc.paragraphs:
-                text_part = p.text
-                remaining = 1_000_000 - total
-                if remaining <= 0:
-                    break
-                parts.append(text_part[:remaining])
-                total += min(len(text_part), remaining)
-            content = "\n".join(parts)
-        except Exception:
-            content = ""
-    elif (
-        content_type in ("application/zip", "application/x-zip-compressed", "application/x-zip")
-        or filename.lower().endswith(".zip")
-    ):
-        import zipfile
-        parts, total = [], 0
-        try:
-            with zipfile.ZipFile(str(disk_path)) as zf:
-                names = [
-                    n for n in zf.namelist()
-                    if not n.endswith("/") and not n.startswith("__MACOSX")
-                    and "/.DS_Store" not in n
-                ]
-                for name in names[:50]:
-                    try:
-                        info = zf.getinfo(name)
-                        if info.file_size > 200_000:
-                            parts.append(f"=== {name} [skipped: file too large] ===")
-                            continue
-                        data = zf.read(name)
-                        try:
-                            text_part = data.decode("utf-8")
-                        except UnicodeDecodeError:
-                            try:
-                                text_part = data.decode("latin-1")
-                            except Exception:
-                                continue
-                        remaining = 1_000_000 - total
-                        if remaining <= 0:
-                            break
-                        text_part = text_part[:remaining]
-                        parts.append(f"=== {name} ===\n{text_part}")
-                        total += len(text_part)
-                    except Exception as ex:
-                        parts.append(f"=== {name} [error: {ex}] ===")
-        except zipfile.BadZipFile:
-            parts = ["[Invalid ZIP file]"]
-        content = "\n\n".join(parts)
-    elif not content_type.startswith("image/"):
-        try:
-            with disk_path.open("rb") as src:
-                content = src.read(1_000_000).decode("utf-8", errors="replace")
-        except Exception:
-            content = ""
-
-    if len(content) > 1_000_000:
-        content = content[:1_000_000] + "\n...[extracted text truncated]"
+    # Binary originals are retained unchanged. Full extracted text is a separate
+    # sidecar, never inserted into PostgreSQL TEXT or blindly sent to a model.
+    from .attachment_processing import extract_attachment
+    extraction = await asyncio.to_thread(extract_attachment, disk_path, content_type)
+    import json as _json
+    (disk_path.parent / "manifest.json").write_text(
+        _json.dumps({k: v for k, v in extraction.items() if k != "extracted_path"},
+                    ensure_ascii=False), encoding="utf-8")
+    file_type = "image" if content_type.startswith("image/") else extraction["kind"]
 
     from .database import save_attachment
-    await save_attachment(
-        conversation_id or "",
-        filename,
-        content_type,
-        content,
-        user_id=user["id"],
-        storage_path=str(rel_path).replace("\\", "/"),
-        size_bytes=size_bytes,
-        attachment_id=aid,
-    )
+    try:
+        await save_attachment(
+            conversation_id or "", filename, content_type, "",
+            user_id=user["id"],
+            storage_path=rel_path.as_posix(),
+            size_bytes=size_bytes, attachment_id=aid,
+        )
+    except Exception:
+        disk_path.unlink(missing_ok=True)
+        (disk_path.parent / "extracted.txt").unlink(missing_ok=True)
+        raise
 
     return {
-        "id": aid,
-        "attachment_id": aid,
-        "filename": filename,
-        "name": filename,
-        "type": file_type,
-        "content_type": content_type,
+        "id": aid, "attachment_id": aid,
+        "filename": filename, "name": filename,
+        "type": file_type, "content_type": content_type,
         "size": size_bytes,
+        "extraction": {
+            "kind": extraction["kind"],
+            "complete": extraction["complete"],
+            "note": extraction.get("note", ""),
+            "extracted_bytes": extraction.get("extracted_bytes", 0),
+        },
     }
+
 
 
 # ── Workspace file API ────────────────────────────────────────────────────────
@@ -560,93 +494,24 @@ async def admin_costs(
 # ── Conversation export ───────────────────────────────────────────────────────
 
 def _strip_md(text: str) -> str:
-    import re
-    text = re.sub(r'```[\s\S]*?```', '[code block]', text)
-    text = re.sub(r'`[^`]+`', lambda m: m.group(0)[1:-1], text)
-    text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
-    text = re.sub(r'[*_~]', '', text)
-    return text.strip()
+    """Legacy helper kept for callers; no content removal is permitted."""
+    return text or ""
 
 
 def _export_pdf(title: str, messages: list) -> io.BytesIO:
-    from fpdf import FPDF
-    from .agents.tools import pdf_safe_text
-    pdf = FPDF()
-    pdf.add_page()
-    pdf.set_margins(20, 20, 20)
-    pdf.set_auto_page_break(auto=True, margin=20)
-
-    # Title
-    pdf.set_font("Helvetica", "B", 16)
-    pdf.cell(0, 10, pdf_safe_text(title[:80]), new_x="LMARGIN", new_y="NEXT", align="C")
-    pdf.ln(4)
-
-    for msg in messages:
-        role = (msg["role"] or "").upper()
-        content = _strip_md(msg.get("content") or "")
-        if not content:
-            continue
-
-        # Role label
-        pdf.set_font("Helvetica", "B", 10)
-        if role == "USER":
-            pdf.set_text_color(120, 70, 40)
-        else:
-            pdf.set_text_color(80, 60, 160)
-        pdf.cell(0, 7, f"[{role}]", new_x="LMARGIN", new_y="NEXT")
-        pdf.set_text_color(30, 25, 20)
-
-        # Content
-        pdf.set_font("Helvetica", size=10)
-        for line in content.split("\n"):
-            safe = pdf_safe_text(line.rstrip())
-            if safe.strip():
-                pdf.multi_cell(0, 6, safe, new_x="LMARGIN", new_y="NEXT")
-            else:
-                pdf.ln(2)
-        pdf.ln(5)
-
-    raw = pdf.output()
-    buf = io.BytesIO(raw)
-    buf.seek(0)
-    return buf
+    from .chat_export import export_pdf
+    return export_pdf(title, messages)
 
 
 def _export_docx(title: str, messages: list) -> io.BytesIO:
-    from docx import Document
-    from docx.shared import Pt, RGBColor
-    doc = Document()
-    doc.add_heading(title[:80], 0)
-
-    for msg in messages:
-        role = (msg["role"] or "").upper()
-        content = _strip_md(msg.get("content") or "")
-        if not content:
-            continue
-
-        # Role heading
-        p = doc.add_paragraph()
-        run = p.add_run(f"[{role}]")
-        run.bold = True
-        if role == "USER":
-            run.font.color.rgb = RGBColor(0x78, 0x46, 0x28)
-        else:
-            run.font.color.rgb = RGBColor(0x50, 0x3C, 0xA0)
-        run.font.size = Pt(10)
-
-        # Content paragraph
-        doc.add_paragraph(content)
-
-    buf = io.BytesIO()
-    doc.save(buf)
-    buf.seek(0)
-    return buf
+    from .chat_export import export_docx
+    return export_docx(title, messages)
 
 
 @app.get("/conversations/{conv_id}/export")
 async def export_conversation(
     conv_id: str,
-    format: str = Query("pdf", regex="^(pdf|docx)$"),
+    format: str = Query("pdf", pattern=r"^(pdf|docx|md)$"),
     user=Depends(get_current_user),
 ):
     conv = await get_conversation(conv_id, user["id"])
@@ -657,20 +522,30 @@ async def export_conversation(
     title = conv.get("title") or "Conversation"
     safe_title = "".join(c for c in title if c.isalnum() or c in " _-")[:40].strip() or "conversation"
 
-    if format == "pdf":
-        buf = _export_pdf(title, msgs)
+    if format == "md":
+        # Lossless, machine-readable export of every message and code fence.
+        parts = [f"# {title}"]
+        for m in msgs:
+            parts.append(f"\n## {(m.get('role') or 'assistant').upper()}\n\n{m.get('content') or ''}")
+        data = "\n".join(parts).encode("utf-8")
         return StreamingResponse(
-            buf,
-            media_type="application/pdf",
-            headers={"Content-Disposition": f'attachment; filename="{safe_title}.pdf"'},
+            io.BytesIO(data), media_type="text/markdown; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="{safe_title}.md"'},
         )
-    else:
-        buf = _export_docx(title, msgs)
-        return StreamingResponse(
-            buf,
-            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            headers={"Content-Disposition": f'attachment; filename="{safe_title}.docx"'},
-        )
+    try:
+        if format == "pdf":
+            buf = await asyncio.to_thread(_export_pdf, title, msgs)
+            mime = "application/pdf"
+        else:
+            buf = await asyncio.to_thread(_export_docx, title, msgs)
+            mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    except Exception as exc:
+        # Never substitute a lossy shortened document on encoding/render failure.
+        raise HTTPException(status_code=422, detail=f"Export could not preserve content: {exc}") from exc
+    return StreamingResponse(
+        buf, media_type=mime,
+        headers={"Content-Disposition": f'attachment; filename="{safe_title}.{format}"'},
+    )
 
 
 # ── WebSocket ─────────────────────────────────────────────────────────────────

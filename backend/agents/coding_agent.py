@@ -20,13 +20,21 @@ Your job is to complete the user's task, not merely describe how it could be don
 - Tool errors are evidence, not success. Diagnose and retry with a corrected approach.
 - Keep progress updates short and factual. Do not expose private chain-of-thought.
 - Never claim a file was created or changed unless a tool result confirms it.
+- For factual comparisons or simple workflows, prefer a valid Mermaid diagram or deterministic numeric chart over costly generated raster images. Use generation tools when the user explicitly asks for image assets.
+- Mermaid nodes with punctuation or spaces must have quoted labels: A["QI-TEST 17K rows"] --> B["DataHub"]. Avoid raw HTML tags.
+- Numeric chart specifications must be strict JSON fenced as chart, with type, data.labels, and numeric data.datasets; do not invent measurements.
+- If a tool generated an image, use its actual workspace-relative path, e.g. ![Description](images/actual-file.png). Do not invent /images URLs or nonexistent filenames.
 - Never access paths outside the active workspace.
 
 ## Artifact creation
 Use dedicated PDF/PPTX/DOCX/XLSX tools when they fit. For presentations, plan the deck, generate any needed images/charts first, then create the PPTX once with the final assets.
 
-## Web research
+## Research and verifiability
 For time-sensitive or unknown facts, search first and crawl authoritative results as needed. Distinguish sourced facts from your own synthesis.
+Ground factual claims in exact file line numbers, worksheet names, row counts, PDF page numbers or authoritative web URLs returned by tools. Cite those identifiers in the answer; never fabricate references, values, or file content.
+For uploaded CSV/XLSX, first call file_overview to scan every row deterministically. For long documents/ZIP archives, inspect files through read_file with NEXT_START_LINE, search_files, and targeted tools; do not call a first-page sample a complete review.
+If a source exceeds one model context, retain its original and work through successive bounded tool reads. Tell the user which sections have actually been verified and which remain for continuation.
+Public Bitbucket/repository URLs can be fetched with web tools. If private access is denied, explicitly request an authorized connector or uploaded ZIP; never claim the inaccessible repository was read.
 
 ## Completion
 Finish with a concise summary of what changed, validations run, and the exact files/artifacts produced.
@@ -53,29 +61,46 @@ async def run_coding_agent(
     Streams tokens via token_callback as they arrive.
     Returns final assistant text.
     """
-    # Build a bounded message list for the agent. Re-injecting entire files from
-    # every prior turn made long conversations balloon until even premium models
-    # behaved inconsistently. Keep the newest useful context within a hard budget.
-    from .chat_agent import attachments_to_text, _route
+    # Recent context fits one model call; complete historical text and uploaded
+    # originals are retained in the workspace for read_file pagination.
+    # Never embed megabytes of extracted file content into the prompt.
+    from .chat_agent import _route
     messages = [{"role": "system", "content": _CODING_SYSTEM}]
-    budget = 120_000
-    selected = []
+    budget = 110_000
     used = 0
-    for m in reversed(history):
-        if m.get("role") not in ("user", "assistant"):
+    selected = []
+    excluded = 0
+    for item in reversed(history):
+        if item.get("role") not in ("user", "assistant"):
             continue
-        content = m.get("content", "") or ""
-        atts = m.get("attachments") if m.get("role") == "user" else None
-        if atts:
-            content = attachments_to_text(atts) + "\n\n" + content
-        if len(content) > 40_000:
-            content = content[:40_000] + "\n...[older attachment/context truncated]"
-        cost = len(content)
-        if selected and used + cost > budget:
-            break
-        selected.append({"role": m["role"], "content": content})
-        used += cost
+        content = str(item.get("content") or "")
+        attachments = item.get("attachments") or []
+        if attachments:
+            references = ", ".join(
+                str(a.get("name") or "attachment") for a in attachments if isinstance(a, dict)
+            )
+            content += f"\n[Earlier attachment references: {references}; full files in workspace/uploads]"
+        if used + len(content) > budget:
+            excluded += 1
+            continue
+        selected.append({"role": item["role"], "content": content})
+        used += len(content)
+    if excluded:
+        messages.append({
+            "role": "system",
+            "content": (
+                f"{excluded} older conversation turns are outside the active model context. "
+                "Their exact text is retained in uploads/_conversation_history.txt. "
+                "Use read_file with line ranges for earlier details. Do not claim "
+                "to have read omitted turns unless you actually retrieve them."
+            ),
+        })
     messages.extend(reversed(selected))
+    if len(user_message) > budget:
+        raise ValueError(
+            "User prompt alone exceeds one model context call. Attach the text "
+            "as a file for paginated analysis; the original message remains saved."
+        )
     messages.append({"role": "user", "content": user_message})
 
     provider = _route(model)
@@ -100,6 +125,9 @@ async def run_coding_agent(
                     await asyncio.sleep(0)
             final_answer = content
 
+        if finish in ("length", "max_tokens", "model_context_window_exceeded"):
+            await token_callback("\n\n**Model output limit reached. Reply 'continue' for the remainder.**")
+            break
         if finish == "stop" or not tool_calls:
             break
 
@@ -149,6 +177,14 @@ async def run_coding_agent(
                 "content": model_result,
             })
 
+    else:
+        notice = (
+            "\n\n**Analysis paused at the per-run tool-step limit. "
+            "No source files were deleted. Reply 'continue' to resume from the "
+            "saved workspace and inspect remaining sections.**"
+        )
+        await token_callback(notice)
+        final_answer += notice
     return final_answer
 
 

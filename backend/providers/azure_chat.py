@@ -61,8 +61,13 @@ async def stream_chat(
 
     async with await c.chat.completions.create(**kw) as stream:
         async for chunk in stream:
-            if chunk.choices and chunk.choices[0].delta.content:
-                yield chunk.choices[0].delta.content
+            if not chunk.choices:
+                continue
+            choice = chunk.choices[0]
+            if choice.delta.content:
+                yield choice.delta.content
+            if choice.finish_reason == "length":
+                yield "\n\n**Model output limit reached. Reply 'continue' for the remainder.**"
 
 
 async def complete_with_tools(
