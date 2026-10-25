@@ -53,8 +53,13 @@ async def stream_gpt5(
     )
     async with resp as stream:
         async for chunk in stream:
-            if chunk.choices and chunk.choices[0].delta.content:
-                yield chunk.choices[0].delta.content
+            if not chunk.choices:
+                continue
+            choice = chunk.choices[0]
+            if choice.delta.content:
+                yield choice.delta.content
+            if choice.finish_reason == "length":
+                yield "\n\n**Model output limit reached. Reply 'continue' for the remainder.**"
 
 
 def _responses_output_text(data: dict) -> str:
@@ -109,6 +114,8 @@ async def stream_codex_responses_api(
                         text = _responses_output_text(event.get("response") or {})
                         if text:
                             yield text
+                elif kind == "response.incomplete":
+                    yield "\n\n**Model output limit reached. Reply 'continue' for the remainder.**"
                 elif kind in ("response.failed", "error"):
                     error = event.get("error") or (event.get("response") or {}).get("error") or {}
                     raise RuntimeError(f"Responses API failed: {error.get('message', str(error))}")
