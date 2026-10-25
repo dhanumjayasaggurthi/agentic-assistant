@@ -442,9 +442,9 @@ function RunCard({ run }) {
 
 /* ── User-visible progress (status/tool events, not hidden model reasoning) ── */
 
-function ActivityPanel({ events = [], live = false }) {
+function ActivityPanel({ events = [], live = false, run = null }) {
   const [expanded, setExpanded] = useState(live);
-  if (!live && !events.length) return null;
+  if (!live && !events.length && !run) return null;
   const current = events.length ? events[events.length - 1].action : 'Preparing response…';
   return (
     <div className="activity-panel">
@@ -463,6 +463,7 @@ function ActivityPanel({ events = [], live = false }) {
               <span>{event.action}</span>
             </div>
           ))}
+          {run && <RunCard run={run} />}
           {live && <span className="activity-still-running">Working — you can stop this response at any time.</span>}
         </div>
       )}
@@ -501,9 +502,8 @@ function Message({ msg, onSpeak, onImageClick, streaming }) {
         <span className="msg-ai-name">RDI AI</span>
         <span className="msg-ai-meta">{msg.meta || ''}</span>
       </div>
-      {(streaming || (msg.activity || []).length > 0) &&
-        <ActivityPanel live={!!streaming} events={msg.activity || []} />}
-      {msg.run && <RunCard run={msg.run} />}
+      {(streaming || (msg.activity || []).length > 0 || msg.run) &&
+        <ActivityPanel live={!!streaming} events={msg.activity || []} run={msg.run} />}
       {images.length > 0 && (
         <div className={'img-grid ' + (images.length === 1 ? 'g1' : images.length === 2 ? 'g2' : '')} style={{ marginBottom: 14 }}>
           {images.map((a, i) => (
@@ -1271,6 +1271,7 @@ function App() {
       RdiWS.send({ type: 'list_conversations' });
     });
     RdiWS.on('error', d => {
+      if (d.request_id && d.request_id !== pendingRequestRef.current) return;
       if (streamRef.current || runRef.current) finalizeStream();
       busyRef.current = false;
       pendingRequestRef.current = null;
@@ -1283,6 +1284,7 @@ function App() {
       setStreamRun(runRef.current);
     });
     RdiWS.on('run_step', d => {
+      if (d.final && !busyRef.current) return; // cancelled run already finalized
       runRef.current = { ...(runRef.current || {}), run_id: d.run_id, steps: d.steps || [], final: d.final };
       setStreamRun(runRef.current);
       if (d.final) setPermission(null);
@@ -1298,6 +1300,7 @@ function App() {
     RdiWS.on('permission_auto', d => pushToast(`auto-approved read-only: ${d.tool}`));
     RdiWS.on('auto_allow_set', d => setAutoAllow(!!d.enabled));
 
+    RdiWS.on('request_rejected', d => pushToast(d.message || 'Request rejected', true));
     RdiWS.on('tool_result', () => {});
     RdiWS.on('activity', d => {
       activityRef.current = [...activityRef.current, { action: d.action || 'Working…', icon: d.icon || '·' }].slice(-16);
@@ -1317,7 +1320,8 @@ function App() {
       pushToast(d.message || 'Run stopped');
     });
     RdiWS.on('workspace', d => {
-      if (d.conv_id && d.conv_id !== convRef.current) return;
+      const responseConv = d.conversation_id || d.conv_id;
+      if (responseConv && responseConv !== convRef.current) return;
       setWsFiles(d.files || []); if (d.workspace_mode) setWsMode(d.workspace_mode);
     });
     RdiWS.on('artifacts', d => {
@@ -1408,7 +1412,7 @@ function App() {
     runRef.current = null; setStreamRun(null);
     activityRef.current = []; setActivity([]);
     setBusy(false); setPermission(null); setArtifacts([]);
-    setFallback(null);
+    setCrossChat(false); setFallback(null);
   };
 
   const newConversation = () => {
