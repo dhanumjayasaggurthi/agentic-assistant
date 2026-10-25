@@ -15,7 +15,7 @@ const RdiRichContent = (() => {
     return source.replace(/\b([A-Za-z_][\w-]*)\[([^\]\r\n]*)\]/g, (match, id, label) => {
       if (/^"[^"]*"$/.test(label.trim())) return match;
       const clean = label
-        .replace(/<br\s*\/?\s*>/gi, '<br/>')
+        .replace(/<br\s*\/?\s*>/gi, ' ')
         .replace(/<\/?(?:code|b|strong|em|i)>/gi, '')
         .replace(/"/g, '&quot;');
       return id + '["' + clean + '"]';
@@ -172,9 +172,13 @@ const RdiRichContent = (() => {
 
   async function enhance(root, conversationId, headers = {}) {
     if (!root) return;
-    await loadWorkspaceImages(root, conversationId, headers);
+    // Image downloads must not block independent chart/diagram rendering.
+    void loadWorkspaceImages(root, conversationId, headers);
     if (window.mermaid && !initialized) {
-      window.mermaid.initialize({ startOnLoad: false, securityLevel: 'strict', theme: 'neutral' });
+      window.mermaid.initialize({
+        startOnLoad: false, securityLevel: 'strict', theme: 'neutral',
+        flowchart: { htmlLabels: false }
+      });
       initialized = true;
     }
     for (const codeEl of root.querySelectorAll('pre > code')) {
