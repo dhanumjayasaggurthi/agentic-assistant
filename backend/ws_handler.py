@@ -710,6 +710,7 @@ class WSSession:
                                 history: list = None) -> None:
         t0 = time.time()
         full_response = ""
+        generated_images: List[Dict] = []
         await self._load_ws_settings()
         _tok = _workspace_var.set(self._conv_workspace(cid))
 
@@ -931,18 +932,27 @@ class WSSession:
                 await st.emit({"type": "workspace", "files": get_file_tree()})
 
         async def _image_fn(b64: str, filename: str):
+            # The image tool writes under workspace/images/, not workspace/.
+            safe_name = Path(filename).name
+            relative = f"images/{safe_name}"
             try:
-                ws_dir = self._conv_workspace(cid)
-                fpath = ws_dir / filename
-                if fpath.exists():
-                    await register_artifact(cid, filename, filename, run_id=run_id,
-                                            kind="image", size_bytes=fpath.stat().st_size)
+                fpath = self._conv_workspace(cid) / relative
+                if fpath.is_file():
+                    await register_artifact(
+                        cid, safe_name, relative, run_id=run_id,
+                        kind="image", size_bytes=fpath.stat().st_size
+                    )
+                    # Persist a lightweight reference, never a duplicate base64
+                    # payload in the message database.
+                    generated_images.append({
+                        "name": safe_name, "type": "image/png", "path": relative
+                    })
             except Exception:
-                pass
+                _logger.exception("Failed to register generated image artifact")
             await st.emit({
                 "type": "image_result",
                 "base64": b64,
-                "filename": filename,
+                "filename": safe_name,
                 "from_agent": True,
             })
 
@@ -977,8 +987,9 @@ class WSSession:
         out_toks = max(1, len(full_response) // 4)
 
         if cancelled:
-            if full_response:
-                await add_message(cid, "assistant", full_response)
+            if full_response or generated_images:
+                await add_message(cid, "assistant", full_response,
+                                  attachments=generated_images or None)
 
             await finish_run(run_id, "cancelled", in_toks, out_toks, 0.0, error=err_text)
             await st.emit({"type": "run_step", "run_id": run_id,
@@ -986,8 +997,9 @@ class WSSession:
             return
 
         if agent_failed:
-            if full_response:
-                await add_message(cid, "assistant", full_response)
+            if full_response or generated_images:
+                await add_message(cid, "assistant", full_response,
+                                  attachments=generated_images or None)
 
             await finish_run(run_id, "error", in_toks, out_toks, 0.0, error=err_text)
             await st.emit({"type": "run_step", "run_id": run_id,
@@ -996,7 +1008,8 @@ class WSSession:
             await st.emit({"type": "activity_done"})
             return
 
-        await add_message(cid, "assistant", full_response)
+        await add_message(cid, "assistant", full_response,
+                          attachments=generated_images or None)
 
         telemetry_emit(
             "agent_run_completed",
