@@ -454,7 +454,16 @@ class WSSession:
             return
         st = _STREAMS.get(_stream_key(self.user["id"], cid))
         if st and st.running:
+            task = st.task
             await self._handle_stop({"conversation_id": cid})
+            if task and not task.done():
+                try:
+                    await asyncio.wait_for(asyncio.shield(task), timeout=3)
+                except asyncio.CancelledError:
+                    pass
+                except asyncio.TimeoutError:
+                    await self.send_error("Run is still stopping; retry deletion after it exits.")
+                    return
         deleted = await delete_conversation(cid, self.user["id"])
         if not deleted:
             await self.send_error("Conversation not found")
