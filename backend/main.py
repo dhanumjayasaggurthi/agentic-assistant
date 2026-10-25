@@ -247,6 +247,10 @@ async def upload_file(
     # sidecar, never inserted into PostgreSQL TEXT or blindly sent to a model.
     from .attachment_processing import extract_attachment
     extraction = await asyncio.to_thread(extract_attachment, disk_path, content_type)
+    import json as _json
+    (disk_path.parent / "manifest.json").write_text(
+        _json.dumps({k: v for k, v in extraction.items() if k != "extracted_path"},
+                    ensure_ascii=False), encoding="utf-8")
     file_type = "image" if content_type.startswith("image/") else extraction["kind"]
 
     from .database import save_attachment
