@@ -41,7 +41,7 @@ jobs:
         run: node tests/visual_artifacts_100.test.js
       - name: Validate screenshot diagrams with actual Mermaid grammar
         run: |
-          npm install --no-save --no-package-lock --ignore-scripts mermaid@10.9.3
+          npm install --no-save --no-package-lock --ignore-scripts mermaid@10.9.3 jsdom@25.0.1
           node tests/mermaid_parser_smoke.mjs
       - name: Verify permissions and unstripped exports
         run: python -m unittest -v tests.test_rich_export_permissions
