@@ -74,14 +74,16 @@ def attachments_to_text(
         else:
             content = str(att.get("content", "") or "")
             if len(content) > per_file_chars:
-                content = content[:per_file_chars] + "\n...[attachment truncated]"
+                raise ValueError(
+                    f"Attachment {name!r} exceeds the {per_file_chars:,}-character model context limit. "
+                    "The full file is retained; ask to analyze a specific section or split the request."
+                )
             piece = f"--- Attached file: {name} ---\n{content}\n---"
-        remaining = total_chars - used
-        if remaining <= 0:
-            parts.append("[Additional attachments omitted from model context]")
-            break
-        if len(piece) > remaining:
-            piece = piece[:remaining] + "\n...[attachment context limit reached]"
+        if used + len(piece) > total_chars:
+            raise ValueError(
+                f"Attachment context exceeds {total_chars:,} characters. "
+                "No attachment was silently omitted. Select fewer files or a smaller section."
+            )
         parts.append(piece)
         used += len(piece)
     return "\n\n".join(parts)
@@ -153,18 +155,20 @@ async def stream_response(
 
 
 def trim_history(history: List[Dict], max_chars: int = 180_000) -> List[Dict]:
-    """Sliding window: drop the OLDEST messages first, keeping newest within budget.
+    """Validate model context without deleting earlier turns or uploaded content.
 
-    history holds only user/assistant turns (no system message), so we pop from
-    index 0. Attachment content counts toward the budget too."""
-    def _size(m: Dict) -> int:
-        n = len(str(m.get("content", "")))
-        for att in m.get("attachments") or []:
-            n += len(str(att.get("content", "")))
-        return n
-
-    total = sum(_size(m) for m in history)
-    while total > max_chars and len(history) > 1:
-        removed = history.pop(0)
-        total -= _size(removed)
+    This limit is intentionally bounded: model context is finite and unbounded
+    concatenation would increase latency/cost and risk provider failures.
+    """
+    total = sum(
+        len(str(m.get("content", ""))) +
+        sum(len(str(att.get("content", ""))) for att in m.get("attachments") or [])
+        for m in history
+    )
+    if total > max_chars:
+        raise ValueError(
+            f"Conversation context is {total:,} characters, above the safe "
+            f"{max_chars:,}-character model input limit. Nothing was removed "
+            "or sent partially. Start a new conversation or reduce the input."
+        )
     return history
