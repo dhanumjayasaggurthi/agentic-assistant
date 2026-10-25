@@ -542,7 +542,19 @@ function Message({ msg, onSpeak, onImageClick, streaming }) {
       </div>}
       {!streaming && msg.content && (
         <div className="msg-actions">
-          <button className="txt-btn" onClick={() => navigator.clipboard.writeText(msg.content)}>copy</button>
+          <button className="txt-btn" onClick={async () => {
+            try { await navigator.clipboard.writeText(msg.content); }
+            catch (err) { alert('Text copy unavailable: ' + err.message); }
+          }}>copy text</button>
+          <button className="txt-btn" onClick={async () => {
+            try {
+              if (!navigator.clipboard?.write || !window.ClipboardItem) throw new Error('Rich copy needs HTTPS or localhost');
+              await navigator.clipboard.write([new ClipboardItem({
+                'text/html': new Blob([bodyRef.current?.innerHTML || ''], { type: 'text/html' }),
+                'text/plain': new Blob([msg.content], { type: 'text/plain' }),
+              })]);
+            } catch (err) { alert('Rich copy unavailable: ' + err.message); }
+          }}>copy formatted</button>
           <button className="txt-btn" onClick={() => onSpeak(msg.content)}>speak</button>
         </div>
       )}
@@ -1698,6 +1710,7 @@ function App() {
                     </button>
                     <button className="chip" onClick={() => exportConv('pdf')}><Ic.dl /> PDF</button>
                     <button className="chip" onClick={() => exportConv('docx')}><Ic.dl /> DOCX</button>
+                    <button className="chip" title="Lossless conversation Markdown source" onClick={() => exportConv('md')}><Ic.dl /> Markdown</button>
                   </React.Fragment>
                 )}
                 {agentMode && (
