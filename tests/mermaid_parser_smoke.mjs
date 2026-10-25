@@ -10,7 +10,7 @@ globalThis.document = dom.window.document;
 globalThis.Element = dom.window.Element;
 globalThis.HTMLElement = dom.window.HTMLElement;
 globalThis.SVGElement = dom.window.SVGElement;
-globalThis.navigator = dom.window.navigator;
+Object.defineProperty(globalThis, 'navigator', { value: dom.window.navigator, configurable: true });
 
 // Import only after the browser globals exist: DOMPurify needs an initialized DOM.
 const mermaid = (await import('mermaid')).default;
