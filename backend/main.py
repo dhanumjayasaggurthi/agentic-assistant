@@ -646,7 +646,7 @@ def _export_docx(title: str, messages: list) -> io.BytesIO:
 @app.get("/conversations/{conv_id}/export")
 async def export_conversation(
     conv_id: str,
-    format: str = Query("pdf", regex="^(pdf|docx)$"),
+    format: str = Query("pdf", pattern=r"^(pdf|docx)$"),
     user=Depends(get_current_user),
 ):
     conv = await get_conversation(conv_id, user["id"])
