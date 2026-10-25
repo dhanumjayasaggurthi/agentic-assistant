@@ -550,7 +550,8 @@ def _file_overview(args: Dict) -> str:
     suffix = path.suffix.lower()
     reports = []
     if suffix in (".csv", ".tsv"):
-        stream = path.open("r", encoding="utf-8-sig", errors="replace", newline="")
+        from ..attachment_processing import _text_encoding
+        stream = path.open("r", encoding=_text_encoding(path), errors="replace", newline="")
         with stream as file:
             reader = csv.reader(file, delimiter="\t" if suffix == ".tsv" else ",")
             header = next(reader, [])
