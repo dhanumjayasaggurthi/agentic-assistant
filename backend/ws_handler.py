@@ -92,21 +92,23 @@ class StreamState:
         self.perm_decisions: Dict[str, str] = {}
         self.auto_allow_readonly = False
         self.task: Optional[asyncio.Task] = None
+        self._emit_lock = asyncio.Lock()
 
     async def emit(self, data: dict) -> None:
-        # Route every live/replayed event to the conversation that produced it.
-        data = {**data, "conversation_id": self.key.split(":", 1)[1]}
-        self.seq += 1
-        data["seq"] = self.seq
-        self.buffer.append(data)
-        sess = self.session
-        if sess is not None:
-            try:
-                await sess.ws.send_json(data)
-            except Exception:
-                # Socket is gone — detach; the run continues and buffers.
-                if self.session is sess:
-                    self.session = None
+        # Serialize live sends with reconnect replay so tokens never arrive
+        # out of order or overtake an older replayed chunk.
+        async with self._emit_lock:
+            data = {**data, "conversation_id": self.key.split(":", 1)[1]}
+            self.seq += 1
+            data["seq"] = self.seq
+            self.buffer.append(data)
+            sess = self.session
+            if sess is not None:
+                try:
+                    await sess.ws.send_json(data)
+                except Exception:
+                    if self.session is sess:
+                        self.session = None
 
     def replay_after(self, last_seq: int) -> List[dict]:
         return [e for e in self.buffer if e.get("seq", 0) > last_seq]
@@ -346,20 +348,21 @@ class WSSession:
                 "current_seq": 0, "last_run": run,
             })
             return
-        st.session = self
-        replay = st.replay_after(last_seq)
-        await self.send({
-            "type": "resume_ok", "conversation_id": cid,
-            "running": st.running,
-            "replayed": len(replay),
-            "current_seq": st.seq,
-        })
-        for ev in replay:
-            try:
-                await self.ws.send_json(ev)
-            except Exception:
-                st.session = None
-                return
+        async with st._emit_lock:
+            st.session = self
+            replay = st.replay_after(last_seq)
+            await self.send({
+                "type": "resume_ok", "conversation_id": cid,
+                "running": st.running,
+                "replayed": len(replay),
+                "current_seq": st.seq,
+            })
+            for ev in replay:
+                try:
+                    await self.ws.send_json(ev)
+                except Exception:
+                    st.session = None
+                    return
 
     async def _handle_stop(self, data: dict) -> None:
         request_id = data.get("request_id")
