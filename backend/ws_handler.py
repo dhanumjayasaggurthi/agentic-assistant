@@ -625,11 +625,18 @@ class WSSession:
 
         agent_mode = bool(data.get("agent_mode", False))
         auto_agent = bool(data.get("auto_agent", True))
-        if not agent_mode and auto_agent and _should_auto_agent(user_msg, model_atts):
+        # Reading substantial documents requires file tools regardless of the
+        # UI's Chat/Agent selection. Keep the selected model when tool-capable;
+        # report any necessary orchestrator fallback to the user.
+        has_documents = any(not (a.get("type") or "").startswith("image/")
+                            for a in model_atts)
+        long_context = sum(len(str(m.get("content", ""))) for m in history) > 100_000
+        if not agent_mode and (has_documents or long_context or
+                               (auto_agent and _should_auto_agent(user_msg, model_atts))):
             agent_mode = True
             await st.emit({
                 "type": "auto_agent_started",
-                "reason": "This request requires tools or workspace actions, so it was promoted to an agent run.",
+                "reason": "Analyzing complete attachments using paginated tools; originals are retained.",
             })
         if agent_mode:
             await self._run_coding_agent(user_msg, model, cid, st,
@@ -771,48 +778,84 @@ class WSSession:
         await st.emit({"type": "run_started", "run_id": run_id,
                        "model": run_model, "requested_model": requested_model})
 
-        # Inject attachment content so the agent can see it
+        # Materialize both original and extracted text; never paste entire file
+        # contents into a single model request or silently omit large sections.
+        import shutil
+        workspace = self._conv_workspace(cid)
         enriched_msg = user_msg
         atts = _normalize_attachments(attachments)
-        if atts:
-            parts = []
-            for att in atts:
-                name = att.get("name", "file")
-                att_type = att.get("type", "text")
-                content = att.get("content", "")
-                if att_type.startswith("image/") or att_type == "image":
-                    img_path = self._conv_workspace(cid) / "images" / name
-                    img_path.parent.mkdir(parents=True, exist_ok=True)
-                    try:
-                        raw = content.split(",", 1)[1] if content.startswith("data:") else content
-                        img_path.write_bytes(base64.b64decode(raw))
-                        parts.append(f"[Attached image saved to workspace: images/{name}]")
-                    except Exception:
-                        parts.append(f"[Attached image: {name}]")
-                else:
-                    workspace_path = None
-                    storage_path = att.get("storage_path")
-                    if storage_path:
-                        try:
-                            src = (self._ws_base() / storage_path).resolve()
-                            base = self._ws_base().resolve()
-                            if src.is_file() and src.is_relative_to(base):
-                                safe_name = Path(name).name
-                                aid = att.get("attachment_id") or att.get("id") or "attachment"
-                                stored_name = f"{aid[:12]}_{safe_name}"
-                                dst = self._conv_workspace(cid) / "uploads" / stored_name
-                                dst.parent.mkdir(parents=True, exist_ok=True)
-                                dst.write_bytes(src.read_bytes())
-                                workspace_path = f"uploads/{stored_name}"
-                        except Exception:
-                            workspace_path = None
-                    header = (
-                        f"[Attached file materialized at workspace/{workspace_path}]\n"
-                        if workspace_path else ""
-                    )
-                    parts.append(f"{header}--- Attached file: {name} ---\n{content}\n---")
-            if parts:
-                enriched_msg = "\n\n".join(parts) + "\n\n" + user_msg
+        references = []
+        for att in atts:
+            name = Path(att.get("name", "file")).name
+            aid = str(att.get("attachment_id") or att.get("id") or "legacy")
+            content_type = att.get("type") or ""
+            if content_type.startswith("image/") or content_type == "image":
+                img_path = workspace / "images" / name
+                img_path.parent.mkdir(parents=True, exist_ok=True)
+                content = att.get("content") or ""
+                if content:
+                    raw = content.split(",", 1)[1] if content.startswith("data:") else content
+                    await asyncio.to_thread(img_path.write_bytes, base64.b64decode(raw))
+                references.append(f"- Image: images/{name} (inspect_image tool)")
+                continue
+
+            rel = att.get("storage_path")
+            extracted_path = att.get("extracted_path")
+            destination = None
+            if rel:
+                base = self._ws_base().resolve()
+                source = (base / rel).resolve()
+                if source.is_file() and source.is_relative_to(base):
+                    safe_filename = f"{aid[:12]}_{name}"
+                    original_target = workspace / "uploads" / safe_filename
+                    original_target.parent.mkdir(parents=True, exist_ok=True)
+                    await asyncio.to_thread(shutil.copy2, source, original_target)
+                    destination = original_target.relative_to(workspace).as_posix()
+                    sidecar = source.parent / "extracted.txt"
+                    if sidecar.is_file():
+                        text_target = workspace / "uploads" / (safe_filename + ".extracted.txt")
+                        await asyncio.to_thread(shutil.copy2, sidecar, text_target)
+                        extracted_path = text_target.relative_to(workspace).as_posix()
+            if not destination and att.get("content"):
+                # Handle historical inline-text uploads without disk originals.
+                text_target = workspace / "uploads" / f"{aid[:12]}_{name}.extracted.txt"
+                text_target.parent.mkdir(parents=True, exist_ok=True)
+                await asyncio.to_thread(
+                    text_target.write_text, att["content"], encoding="utf-8"
+                )
+                extracted_path = text_target.relative_to(workspace).as_posix()
+            status = att.get("extraction") or {}
+            note = status.get("note") or ""
+            references.append(
+                f"- {name}: original={destination or 'not available'}; "
+                f"extracted_text={extracted_path or 'not available'}; "
+                f"extraction_complete={status.get('complete', 'unknown')}; "
+                f"notes={note or 'none'}"
+            )
+        if references:
+            enriched_msg = (
+                "Attached sources are workspace files, NOT inline model context. "
+                "Use file_overview, read_file with successive line ranges, "
+                "search_files, or inspect_image as appropriate. For an entire-file "
+                "request, inspect all relevant sections before concluding, "
+                "and explicitly report what was not inspected. Cite file paths, "
+                "sheet names, rows or page labels. Never invent data.\n"
+                + "\n".join(references) + "\n\nUSER REQUEST:\n" + user_msg
+            )
+
+        # Keep complete older messages retrievable even when the LLM's active
+        # context window only includes recent turns.
+        history_target = workspace / "uploads" / "_conversation_history.txt"
+        full_history = "\n\n".join(
+            f"[{m.get('role','unknown').upper()}]\n{m.get('content','')}"
+            for m in (history or [])
+        )
+        if full_history:
+            await asyncio.to_thread(history_target.write_text, full_history, encoding="utf-8")
+            enriched_msg += (
+                "\n\nPrevious conversation text is accessible in "
+                "uploads/_conversation_history.txt via read_file ranges."
+            )
 
         sys_prefix = await self._cross_chat_prefix(cid)
         if sys_prefix:
