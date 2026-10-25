@@ -57,39 +57,45 @@ async def run_coding_agent(
     Streams tokens via token_callback as they arrive.
     Returns final assistant text.
     """
-    # Build a bounded message list for the agent. Re-injecting entire files from
-    # every prior turn made long conversations balloon until even premium models
-    # behaved inconsistently. Keep the newest useful context within a hard budget.
-    from .chat_agent import attachments_to_text, _route
+    # Recent context fits one model call; complete historical text and uploaded
+    # originals are retained in the workspace for read_file pagination.
+    # Never embed megabytes of extracted file content into the prompt.
+    from .chat_agent import _route
     messages = [{"role": "system", "content": _CODING_SYSTEM}]
-    budget = 120_000
-    selected = []
+    budget = 110_000
     used = 0
-    for m in reversed(history):
-        if m.get("role") not in ("user", "assistant"):
+    selected = []
+    excluded = 0
+    for item in reversed(history):
+        if item.get("role") not in ("user", "assistant"):
             continue
-        content = m.get("content", "") or ""
-        atts = m.get("attachments") if m.get("role") == "user" else None
-        if atts:
-            content = attachments_to_text(atts) + "\n\n" + content
-        if len(content) > 40_000:
-            raise ValueError(
-                "A single agent history message exceeds 40,000 characters. "
-                "No content was silently truncated; analyze a selected section or use file tools."
+        content = str(item.get("content") or "")
+        attachments = item.get("attachments") or []
+        if attachments:
+            references = ", ".join(
+                str(a.get("name") or "attachment") for a in attachments if isinstance(a, dict)
             )
-        cost = len(content)
-        if used + cost > budget:
-            raise ValueError(
-                f"Agent history exceeds the {budget:,}-character model context limit. "
-                "No earlier messages were dropped. Start a new conversation or reduce context."
-            )
-        selected.append({"role": m["role"], "content": content})
-        used += cost
+            content += f"\n[Earlier attachment references: {references}; full files in workspace/uploads]"
+        if used + len(content) > budget:
+            excluded += 1
+            continue
+        selected.append({"role": item["role"], "content": content})
+        used += len(content)
+    if excluded:
+        messages.append({
+            "role": "system",
+            "content": (
+                f"{excluded} older conversation turns are outside the active model context. "
+                "Their exact text is retained in uploads/_conversation_history.txt. "
+                "Use read_file with line ranges for earlier details. Do not claim "
+                "to have read omitted turns unless you actually retrieve them."
+            ),
+        })
     messages.extend(reversed(selected))
-    if used + len(user_message) > budget:
+    if len(user_message) > budget:
         raise ValueError(
-            f"Agent input exceeds the {budget:,}-character context limit. "
-            "Input was not truncated or partially sent. Select a smaller section."
+            "User prompt alone exceeds one model context call. Attach the text "
+            "as a file for paginated analysis; the original message remains saved."
         )
     messages.append({"role": "user", "content": user_message})
 
@@ -167,6 +173,14 @@ async def run_coding_agent(
                 "content": model_result,
             })
 
+    else:
+        notice = (
+            "\n\n**Analysis paused at the per-run tool-step limit. "
+            "No source files were deleted. Reply 'continue' to resume from the "
+            "saved workspace and inspect remaining sections.**"
+        )
+        await token_callback(notice)
+        final_answer += notice
     return final_answer
 
 
