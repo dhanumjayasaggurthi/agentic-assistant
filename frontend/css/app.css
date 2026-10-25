@@ -882,3 +882,16 @@ code[class*="language-"], pre[class*="language-"] {
   .rich-graphic svg, .img-cell img { max-height: 250mm !important; max-width: 100% !important; }
   .chat-inner { font-size: 11pt; }
 }
+
+/* File-drop state: visible without blocking native drop handlers. */
+.file-drop-indicator {
+  position: fixed; z-index: 3000; inset: 12px;
+  display: flex; align-items: center; justify-content: center;
+  pointer-events: none; border: 3px dashed var(--ok);
+  border-radius: 14px; background: rgba(80, 150, 105, .11);
+  color: var(--ink); font-size: 18px; font-weight: 600;
+  backdrop-filter: blur(2px);
+}
+.att-chip.failed { max-width: min(100%, 650px); overflow-wrap: anywhere; }
+.att-chip.done { max-width: min(100%, 650px); overflow-wrap: anywhere; }
+@media print { .file-drop-indicator { display: none !important; } }
