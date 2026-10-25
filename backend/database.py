@@ -468,6 +468,11 @@ async def save_attachment(conv_id: str, filename: str, content_type: str,
                           storage_path: str = None, size_bytes: int = 0,
                           attachment_id: str = None) -> str:
     aid, now = attachment_id or str(uuid.uuid4()), _now()
+    # PostgreSQL TEXT cannot contain NUL (U+0000). The binary original is
+    # stored separately; legacy callers may supply actual extracted text.
+    if not isinstance(content, str):
+        raise TypeError("Attachment content must be Unicode text; store binary on disk")
+    content = content.replace("\x00", "\ufffd")
     async with _pool().acquire() as conn:
         await conn.execute(
             "INSERT INTO attachments (id,user_id,conversation_id,message_id,filename,"
