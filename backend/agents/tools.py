@@ -59,6 +59,20 @@ TOOL_DEFINITIONS: List[Dict] = [
     {
         "type": "function",
         "function": {
+            "name": "file_overview",
+            "description": "Scan the ENTIRE CSV/TSV or XLSX file for grounded row counts, columns, missing values and examples. Read-only; no 20k context limit.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Workspace-relative original CSV/TSV/XLSX path"}
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "write_file",
             "description": "Write or overwrite a file in the workspace. Shows a diff preview first.",
             "parameters": {
@@ -454,6 +468,7 @@ def build_preview(tool: str, args: Dict) -> str:
 async def execute_tool(tool: str, args: Dict, image_fn=None) -> str:
     try:
         if tool == "read_file":       return await _read_file(args)
+        if tool == "file_overview":   return await asyncio.to_thread(_file_overview, args)
         if tool == "write_file":      return await _write_file(args)
         if tool == "create_file":     return await _create_file(args)
         if tool == "delete_file":     return await _delete_file(args)
@@ -480,18 +495,92 @@ async def execute_tool(tool: str, args: Dict, image_fn=None) -> str:
 
 async def _read_file(args: Dict) -> str:
     path = _safe_path(args["path"])
-    if not path.exists():
+    if not path.is_file():
         return f"File not found: {args['path']}"
-    text = path.read_text(encoding="utf-8", errors="replace")
-    lines = text.splitlines()
     start = max(1, int(args.get("start_line") or 1))
-    end = int(args.get("end_line") or len(lines))
-    end = max(start, min(end, len(lines)))
-    selected = "\n".join(lines[start - 1:end])
-    max_chars = max(1000, min(int(args.get("max_chars") or 20000), 100000))
-    if len(selected) > max_chars:
-        selected = selected[:max_chars] + "\n...[truncated; request a narrower line range]"
-    return selected
+    stop = int(args.get("end_line") or start + 199)
+    stop = max(start, stop)
+    max_chars = max(1000, min(int(args.get("max_chars") or 12000), 18000))
+    # Stream lines instead of loading a 64 MB extracted document into memory.
+    selected = []
+    count = 0
+    last = start - 1
+    next_line = None
+    with path.open("r", encoding="utf-8", errors="replace") as source:
+        for number, line in enumerate(source, 1):
+            if number < start:
+                continue
+            if number > stop:
+                next_line = number
+                break
+            record = f"[{number}] {line.rstrip()}"
+            if count + len(record) > max_chars:
+                next_line = number
+                break
+            selected.append(record)
+            count += len(record) + 1
+            last = number
+    if last < start and next_line == start:
+        return (f"Line {start} exceeds the {max_chars}-character per-call limit. "
+                "Use file_overview, search_files, or a targeted read.")
+    suffix = (f" NEXT_START_LINE={next_line} (read_file again to continue)"
+              if next_line else " END_OF_FILE")
+    return f"Source: {args['path']} lines {start}-{last}.\n" + "\n".join(selected) + "\n" + suffix
+
+
+def _file_overview(args: Dict) -> str:
+    """Deterministic complete scan; bounded metadata memory, never invent data."""
+    import csv
+    path = _safe_path(args["path"])
+    if not path.is_file():
+        return f"File not found: {args['path']}"
+    suffix = path.suffix.lower()
+    reports = []
+    if suffix in (".csv", ".tsv"):
+        stream = path.open("r", encoding="utf-8-sig", errors="replace", newline="")
+        with stream as file:
+            reader = csv.reader(file, delimiter="\t" if suffix == ".tsv" else ",")
+            header = next(reader, [])
+            total = 0
+            missing = [0] * len(header)
+            samples = []
+            for row in reader:
+                total += 1
+                for i in range(len(header)):
+                    if i >= len(row) or not row[i].strip():
+                        missing[i] += 1
+                if len(samples) < 3:
+                    samples.append({"source_row": total + 1, "values": row[:30]})
+            reports.append({"sheet": None, "rows": total, "columns": header,
+                            "missing_by_column": dict(zip(header, missing)),
+                            "first_three_rows": samples, "scan": "complete"})
+    elif suffix in (".xlsx", ".xlsm"):
+        from openpyxl import load_workbook
+        wb = load_workbook(path, read_only=True, data_only=True, keep_links=False)
+        try:
+            for sheet in wb:
+                rows = sheet.iter_rows(values_only=True)
+                header = [str(x) if x is not None else "" for x in (next(rows, ()))]
+                missing = [0] * len(header)
+                total = 0
+                samples = []
+                for row in rows:
+                    total += 1
+                    for i in range(len(header)):
+                        if i >= len(row) or row[i] is None or str(row[i]) == "":
+                            missing[i] += 1
+                    if len(samples) < 3:
+                        samples.append({"source_row": total + 1,
+                                        "values": [str(v) if v is not None else "" for v in row[:30]]})
+                reports.append({"sheet": sheet.title, "rows": total, "columns": header,
+                                "missing_by_column": dict(zip(header, missing)),
+                                "first_three_rows": samples, "scan": "complete"})
+        finally:
+            wb.close()
+    else:
+        return "file_overview supports CSV, TSV and XLSX only. Use extracted text and read_file for other formats."
+    return json.dumps({"source": args["path"], "reports": reports},
+                      ensure_ascii=False, default=str)
 
 
 async def _write_file(args: Dict) -> str:
