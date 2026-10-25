@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - fix/chat-stream-progress-conversation-isolation-20261025
+      - fix/rich-visual-exports-permissions-no-silent-loss-20261025
   pull_request:
     branches:
       - feature/chatgpt-parity-phase2-2026-09-27
@@ -31,6 +32,12 @@ jobs:
           node --check frontend/js/ws.js
           node --check tests/chat_websocket_100.test.js
           node tests/chat_websocket_100.test.js
+      - name: Verify diagram/chart parser and rich-content syntax
+        run: |
+          node --check frontend/js/rich_content.js
+          node tests/rich_content_100.test.js
+      - name: Verify permissions and unstripped exports
+        run: python -m unittest -v tests.test_rich_export_permissions
       - name: Compile frontend JSX (syntax and structure)
         run: |
           npx --yes esbuild@0.25.12 frontend/js/app.js --loader:.js=jsx --outfile=/tmp/rdi-app-syntax-check.js
