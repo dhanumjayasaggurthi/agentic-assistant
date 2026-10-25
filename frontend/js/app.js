@@ -440,6 +440,36 @@ function RunCard({ run }) {
   );
 }
 
+/* ── User-visible progress (status/tool events, not hidden model reasoning) ── */
+
+function ActivityPanel({ events = [], live = false }) {
+  const [expanded, setExpanded] = useState(live);
+  if (!live && !events.length) return null;
+  const current = events.length ? events[events.length - 1].action : 'Preparing response…';
+  return (
+    <div className="activity-panel">
+      <button type="button" className="activity-toggle" aria-expanded={expanded}
+              onClick={() => setExpanded(value => !value)}>
+        {live && <span className="activity-pulse" aria-label="In progress" />}
+        <span className="activity-summary">{live ? current : 'View completed activity'}</span>
+        <span className="activity-toggle-hint">{expanded ? 'Hide details' : 'Show details'}</span>
+        <Ic.down />
+      </button>
+      {expanded && (
+        <div className="activity-details" role="status" aria-live="polite">
+          {(events.length ? events : [{ action: 'Preparing response…' }]).map((event, index) => (
+            <div className="activity-entry" key={index}>
+              <span aria-hidden="true">{event.icon || '·'}</span>
+              <span>{event.action}</span>
+            </div>
+          ))}
+          {live && <span className="activity-still-running">Working — you can stop this response at any time.</span>}
+        </div>
+      )}
+    </div>
+  );
+}
+
 /* ── Message ───────────────────────────────────────────────────────────────── */
 
 function Message({ msg, onSpeak, onImageClick, streaming }) {
@@ -457,8 +487,7 @@ function Message({ msg, onSpeak, onImageClick, streaming }) {
           {(msg.attachments || []).map((a, i) => (
             <span className="msg-att" key={i}><span className="ok-sq">▪</span> {a.name}</span>
           ))}
-          {(msg.attachments || []).length > 0 && <br />}
-          {msg.content}
+          <div className="msg-user-content" dangerouslySetInnerHTML={renderMarkdown(msg.content || '')} />
         </div>
       </div>
     );
@@ -472,6 +501,8 @@ function Message({ msg, onSpeak, onImageClick, streaming }) {
         <span className="msg-ai-name">RDI AI</span>
         <span className="msg-ai-meta">{msg.meta || ''}</span>
       </div>
+      {(streaming || (msg.activity || []).length > 0) &&
+        <ActivityPanel live={!!streaming} events={msg.activity || []} />}
       {msg.run && <RunCard run={msg.run} />}
       {images.length > 0 && (
         <div className={'img-grid ' + (images.length === 1 ? 'g1' : images.length === 2 ? 'g2' : '')} style={{ marginBottom: 14 }}>
@@ -487,10 +518,11 @@ function Message({ msg, onSpeak, onImageClick, streaming }) {
           ))}
         </div>
       )}
-      <div className="msg-body" ref={bodyRef}>
-        <span dangerouslySetInnerHTML={renderMarkdown(msg.content)} />
-        {streaming && <span className="stream-caret" />}
-      </div>
+      {(msg.content || streaming) && <div className="msg-body" ref={bodyRef}>
+        {msg.content && <div className="msg-markdown" dangerouslySetInnerHTML={renderMarkdown(msg.content)} />}
+        {streaming && !msg.content && <span className="msg-pending">Response in progress…</span>}
+        {streaming && <span className="stream-caret" aria-hidden="true" />}
+      </div>}
       {!streaming && msg.content && (
         <div className="msg-actions">
           <button className="txt-btn" onClick={() => navigator.clipboard.writeText(msg.content)}>copy</button>
@@ -656,7 +688,7 @@ function Composer({ conv, agentMode, model, onOpenModel, onSend, onStop, busy, d
 /* ── Chat / Agent view ─────────────────────────────────────────────────────── */
 
 function ChatView(props) {
-  const { conv, messages, streamText, streamRun, busy, user, agentMode, setAgentMode,
+  const { conv, messages, streamText, streamRun, busy, activity, user, agentMode, setAgentMode,
           onSend, permission, onPermission, model, connState } = props;
   const scrollRef = useRef(null);
   const pinnedRef = useRef(true);
@@ -720,8 +752,9 @@ function ChatView(props) {
             {messages.map((m, i) => (
               <Message key={i} msg={m} onSpeak={speak} onImageClick={props.onImageClick} />
             ))}
-            {(streamText || streamRun) && (
-              <Message msg={{ role: 'assistant', content: streamText, run: streamRun, meta: modelName(model) }}
+            {(busy || streamText || streamRun) && (
+              <Message msg={{ role: 'assistant', content: streamText, run: streamRun,
+                              activity, meta: modelName(model) }}
                        onSpeak={speak} onImageClick={props.onImageClick} streaming={busy} />
             )}
           </div>
