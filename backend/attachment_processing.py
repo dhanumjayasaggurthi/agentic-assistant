@@ -81,6 +81,19 @@ def _read_docx(path: Path, sink: _Sink):
             sink.write(" | ".join(cell.text.replace("\n", " ") for cell in row.cells) + "\n")
 
 
+def _read_pptx(path: Path, sink: _Sink):
+    from pptx import Presentation
+    slides = Presentation(str(path))
+    for i, slide in enumerate(slides.slides, 1):
+        sink.write(f"\n# Slide {i}\n")
+        for shape in slide.shapes:
+            if shape.has_text_frame:
+                sink.write(shape.text + "\n")
+            if shape.has_table:
+                for row in shape.table.rows:
+                    sink.write(" | ".join(cell.text for cell in row.cells) + "\n")
+
+
 def _read_zip(path: Path, sink: _Sink):
     # Inventory only. ZIP members can be arbitrarily large, binary, encrypted,
     # or attacker-controlled; the agent can inspect selected files with tools.
@@ -107,6 +120,8 @@ def extract_attachment(path: Path, content_type: str, budget: int = MAX_EXTRACTE
         kind, handler = "pdf", _read_pdf
     elif suffix == ".docx":
         kind, handler = "document", _read_docx
+    elif suffix == ".pptx":
+        kind, handler = "presentation", _read_pptx
     elif suffix == ".zip":
         kind, handler = "archive_inventory", _read_zip
     elif suffix in {".csv", ".tsv", ".txt", ".md", ".json", ".jsonl",
@@ -121,7 +136,9 @@ def extract_attachment(path: Path, content_type: str, budget: int = MAX_EXTRACTE
 
     sink = _Sink(sidecar, budget)
     complete = True
-    note = ""
+    note = ("Archive inventory only; member contents are not extracted. "
+            "Use a selected archive-member inspection tool or run_python to read files."
+            if kind == "archive_inventory" else "")
     try:
         handler(path, sink)
     except (ExtractionLimit, Exception) as exc:
