@@ -111,6 +111,9 @@ async def run_coding_agent(
                     await asyncio.sleep(0)
             final_answer = content
 
+        if finish in ("length", "max_tokens", "model_context_window_exceeded"):
+            await token_callback("\n\n**Model output limit reached. Reply 'continue' for the remainder.**")
+            break
         if finish == "stop" or not tool_calls:
             break
 
