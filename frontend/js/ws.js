@@ -27,20 +27,20 @@ const RdiWS = (() => {
   function on(type, fn) { _handlers[type] = fn; }
 
   function dispatch(data) {
+    // Resume completion is transport-level: unblock queued sends even if the
+    // user switched chats while the old resume request was in flight.
+    const resumeFinished = data.type === 'resume_ok' && _awaitingResume;
+    if (resumeFinished) _awaitingResume = false;
+
     // A socket may carry late events from a previous conversation. Ignore them
     // BEFORE updating sequence numbers or handing them to React.
-    if (data.conversation_id && data.conversation_id !== _activeConv) return;
-    if (typeof data.seq === 'number' && data.seq > _lastSeq) _lastSeq = data.seq;
-    const fn = _handlers[data.type] || _handlers['*'];
-    if (fn) fn(data);
-
-    // Resume/replay must finish before queued user actions are sent. Previously
-    // the queue flushed immediately after the resume request, allowing new
-    // messages to interleave with replayed stream events.
-    if (data.type === 'resume_ok' && _awaitingResume) {
-      _awaitingResume = false;
-      _flushQueue();
+    const relevant = !data.conversation_id || data.conversation_id === _activeConv;
+    if (relevant) {
+      if (typeof data.seq === 'number' && data.seq > _lastSeq) _lastSeq = data.seq;
+      const fn = _handlers[data.type] || _handlers['*'];
+      if (fn) fn(data);
     }
+    if (resumeFinished) _flushQueue();
   }
 
   function setActiveConversation(cid, startSeq) {
