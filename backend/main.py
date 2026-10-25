@@ -243,109 +243,38 @@ async def upload_file(
             pass
         raise
 
-    # Extract bounded textual context once; original bytes remain on disk.
-    content = ""
-    file_type = "image" if content_type.startswith("image/") else "text"
-    if content_type == "application/pdf":
-        try:
-            import PyPDF2
-            reader = PyPDF2.PdfReader(str(disk_path))
-            parts = []
-            total = 0
-            for page in reader.pages:
-                text_part = page.extract_text() or ""
-                remaining = 1_000_000 - total
-                if remaining <= 0:
-                    break
-                parts.append(text_part[:remaining])
-                total += min(len(text_part), remaining)
-            content = "\n".join(parts)
-        except Exception:
-            content = ""
-    elif "word" in content_type or filename.lower().endswith(".docx"):
-        try:
-            from docx import Document
-            doc = Document(str(disk_path))
-            parts, total = [], 0
-            for p in doc.paragraphs:
-                text_part = p.text
-                remaining = 1_000_000 - total
-                if remaining <= 0:
-                    break
-                parts.append(text_part[:remaining])
-                total += min(len(text_part), remaining)
-            content = "\n".join(parts)
-        except Exception:
-            content = ""
-    elif (
-        content_type in ("application/zip", "application/x-zip-compressed", "application/x-zip")
-        or filename.lower().endswith(".zip")
-    ):
-        import zipfile
-        parts, total = [], 0
-        try:
-            with zipfile.ZipFile(str(disk_path)) as zf:
-                names = [
-                    n for n in zf.namelist()
-                    if not n.endswith("/") and not n.startswith("__MACOSX")
-                    and "/.DS_Store" not in n
-                ]
-                for name in names[:50]:
-                    try:
-                        info = zf.getinfo(name)
-                        if info.file_size > 200_000:
-                            parts.append(f"=== {name} [skipped: file too large] ===")
-                            continue
-                        data = zf.read(name)
-                        try:
-                            text_part = data.decode("utf-8")
-                        except UnicodeDecodeError:
-                            try:
-                                text_part = data.decode("latin-1")
-                            except Exception:
-                                continue
-                        remaining = 1_000_000 - total
-                        if remaining <= 0:
-                            break
-                        text_part = text_part[:remaining]
-                        parts.append(f"=== {name} ===\n{text_part}")
-                        total += len(text_part)
-                    except Exception as ex:
-                        parts.append(f"=== {name} [error: {ex}] ===")
-        except zipfile.BadZipFile:
-            parts = ["[Invalid ZIP file]"]
-        content = "\n\n".join(parts)
-    elif not content_type.startswith("image/"):
-        try:
-            with disk_path.open("rb") as src:
-                content = src.read(1_000_000).decode("utf-8", errors="replace")
-        except Exception:
-            content = ""
-
-    if len(content) > 1_000_000:
-        content = content[:1_000_000] + "\n...[extracted text truncated]"
+    # Binary originals are retained unchanged. Full extracted text is a separate
+    # sidecar, never inserted into PostgreSQL TEXT or blindly sent to a model.
+    from .attachment_processing import extract_attachment
+    extraction = await asyncio.to_thread(extract_attachment, disk_path, content_type)
+    file_type = "image" if content_type.startswith("image/") else extraction["kind"]
 
     from .database import save_attachment
-    await save_attachment(
-        conversation_id or "",
-        filename,
-        content_type,
-        content,
-        user_id=user["id"],
-        storage_path=str(rel_path).replace("\\", "/"),
-        size_bytes=size_bytes,
-        attachment_id=aid,
-    )
+    try:
+        await save_attachment(
+            conversation_id or "", filename, content_type, "",
+            user_id=user["id"],
+            storage_path=rel_path.as_posix(),
+            size_bytes=size_bytes, attachment_id=aid,
+        )
+    except Exception:
+        disk_path.unlink(missing_ok=True)
+        (disk_path.parent / "extracted.txt").unlink(missing_ok=True)
+        raise
 
     return {
-        "id": aid,
-        "attachment_id": aid,
-        "filename": filename,
-        "name": filename,
-        "type": file_type,
-        "content_type": content_type,
+        "id": aid, "attachment_id": aid,
+        "filename": filename, "name": filename,
+        "type": file_type, "content_type": content_type,
         "size": size_bytes,
+        "extraction": {
+            "kind": extraction["kind"],
+            "complete": extraction["complete"],
+            "note": extraction.get("note", ""),
+            "extracted_bytes": extraction.get("extracted_bytes", 0),
+        },
     }
+
 
 
 # ── Workspace file API ────────────────────────────────────────────────────────
