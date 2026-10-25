@@ -165,20 +165,9 @@ async def stream_response(
 
 
 def trim_history(history: List[Dict], max_chars: int = 180_000) -> List[Dict]:
-    """Validate model context without deleting earlier turns or uploaded content.
+    """Keep the durable transcript unchanged.
 
-    This limit is intentionally bounded: model context is finite and unbounded
-    concatenation would increase latency/cost and risk provider failures.
+    LLM context selection is handled at call time. It must never fail the
+    conversation or mutate stored history merely because a file is large.
     """
-    total = sum(
-        len(str(m.get("content", ""))) +
-        sum(len(str(att.get("content", ""))) for att in m.get("attachments") or [])
-        for m in history
-    )
-    if total > max_chars:
-        raise ValueError(
-            f"Conversation context is {total:,} characters, above the safe "
-            f"{max_chars:,}-character model input limit. Nothing was removed "
-            "or sent partially. Start a new conversation or reduce the input."
-        )
     return history
