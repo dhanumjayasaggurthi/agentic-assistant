@@ -355,6 +355,11 @@ class WSSession:
         if task and not task.done():
             task.cancel()
         st.task = None
+        for permission_id, event in list(st.perm_events.items()):
+            _PERM_INDEX.pop(permission_id, None)
+            st.perm_events.pop(permission_id, None)
+            event.set()
+        st.perm_decisions.clear()
         await st.emit({"type": "cancelled", "message": "Run stopped by user."})
         await st.emit({"type": "activity_done"})
 
@@ -420,6 +425,12 @@ class WSSession:
 
     async def _handle_delete_conversation(self, data: dict) -> None:
         cid = data.get("conversation_id")
+        if not await get_conversation(cid, self.user["id"]):
+            await self.send_error("Conversation not found")
+            return
+        st = _STREAMS.get(_stream_key(self.user["id"], cid))
+        if st and st.running:
+            await self._handle_stop({"conversation_id": cid})
         deleted = await delete_conversation(cid, self.user["id"])
         if not deleted:
             await self.send_error("Conversation not found")
@@ -518,7 +529,8 @@ class WSSession:
 
         st = self._attach_stream(cid)
         if st.running and st.task is not asyncio.current_task():
-            await st.emit({"type": "error", "message": "This conversation already has an active response."})
+            await self.send({"type": "request_rejected",
+                             "message": "This conversation already has an active response."})
             return
         st.task = asyncio.current_task()
         st.running = True
@@ -627,7 +639,9 @@ class WSSession:
     # ── Cross-chat context builder ────────────────────────────────────────────
 
     async def _cross_chat_prefix(self, cid: str) -> str:
-        if not self.cross_chat_reference:
+        # Never use session-wide state: a newer conversation may already be active.
+        conv = await get_conversation(cid, self.user["id"])
+        if not conv or not conv.get("cross_chat_reference", False):
             return ""
         others = await get_other_conversation_summaries(self.user["id"], cid)
         if not others:
