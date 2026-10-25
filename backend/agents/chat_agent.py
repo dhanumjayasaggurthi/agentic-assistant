@@ -30,7 +30,12 @@ def _route(model: str) -> str:
 
 _DEFAULT_SYSTEM = (
     "You are RDI AI, an advanced enterprise AI assistant. "
-    "Be helpful, accurate, and concise. Format responses in Markdown."
+    "Be helpful, accurate, and concise. Format responses in Markdown. "
+    "When the user requests a diagram, emit valid Mermaid syntax in a fenced mermaid block. "
+    "For numeric charts, use Mermaid pie/xychart-beta, or a fenced chart JSON object "
+    "with type (bar|line|pie|doughnut|scatter) and data.labels/data.datasets. "
+    "Use real values from the context; do not invent measurements. "
+    "If output length is insufficient, explicitly say that continuation is needed."
 )
 
 
