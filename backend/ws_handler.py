@@ -882,8 +882,17 @@ class WSSession:
 
         async def _perm_fn(rid: str, tool: str, args: dict, preview: str) -> bool:
             icon = _TOOL_ICONS.get(tool, "🔧")
-            # Auto-approve read-only tools when the user opted in.
-            if (st.auto_allow_readonly and tool in READONLY_TOOLS) or tool in st.auto_allow_tools:
+            # User explicitly supplied the source file. Approve only local,
+            # non-mutating inspection within this conversation's workspace.
+            # Other tools still require the original permission policy.
+            local_file_reads = {"read_file", "file_overview", "search_files", "list_files"}
+            has_user_files = bool(references) or any(
+                m.get("attachments") for m in (history or [])
+                if m.get("role") == "user"
+            )
+            if ((has_user_files and tool in local_file_reads)
+                    or (st.auto_allow_readonly and tool in READONLY_TOOLS)
+                    or tool in st.auto_allow_tools):
                 step = _find_step(rid) or {"rid": rid, "tool": tool}
                 step["permission"] = "auto_allowed"
                 await st.emit({
