@@ -22,7 +22,7 @@ window.mermaid = {
   initialize() {},
   async render(id, code) {
     mermaidCalled = true;
-    assert.ok(code.includes('["QI-TEST 17K Rows"]'));
+    assert.ok(code.includes('QI-TEST (~17K Rows)'));
     return { svg: '<svg xmlns="http://www.w3.org/2000/svg" width="300" height="120"><text x="10" y="20">QI-TEST</text></svg>' };
   },
 };
