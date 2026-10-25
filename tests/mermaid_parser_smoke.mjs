@@ -1,6 +1,19 @@
 /* Parse the real reported invalid flowcharts with the same Mermaid major version
  * used by the browser (not a regex-only unit test). */
-import mermaid from 'mermaid';
+import { JSDOM } from 'jsdom';
+
+const dom = new JSDOM('<!doctype html><html><body></body></html>', {
+  url: 'http://localhost:8000',
+});
+globalThis.window = dom.window;
+globalThis.document = dom.window.document;
+globalThis.Element = dom.window.Element;
+globalThis.HTMLElement = dom.window.HTMLElement;
+globalThis.SVGElement = dom.window.SVGElement;
+globalThis.navigator = dom.window.navigator;
+
+// Import only after the browser globals exist: DOMPurify needs an initialized DOM.
+const mermaid = (await import('mermaid')).default;
 import fs from 'node:fs';
 import vm from 'node:vm';
 import assert from 'node:assert/strict';
