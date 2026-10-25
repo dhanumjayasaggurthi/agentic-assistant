@@ -38,6 +38,8 @@ class ChatLifecycleTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch("backend.ws_handler.create_conversation", new_callable=AsyncMock, return_value=new_conv) as create,
             patch("backend.ws_handler.get_messages", new_callable=AsyncMock, return_value=[]),
+            patch("backend.ws_handler.get_conversation", new_callable=AsyncMock,
+                  return_value={"id": "brand-new", "cross_chat_reference": False}),
             patch("backend.ws_handler.add_message", new_callable=AsyncMock),
             patch("backend.ws_handler.auto_title", new_callable=AsyncMock),
             patch("backend.ws_handler.bind_attachments_to_conversation", new_callable=AsyncMock),
