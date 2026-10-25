@@ -485,7 +485,7 @@ function Message({ msg, onSpeak, onImageClick, streaming }) {
   useEffect(() => {
     const timer = setTimeout(() => {
       if (!bodyRef.current) return;
-      if (window.RdiRichContent) window.RdiRichContent.enhance(bodyRef.current);
+      if (typeof RdiRichContent !== 'undefined') RdiRichContent.enhance(bodyRef.current);
       if (window.Prism) bodyRef.current.querySelectorAll('pre code').forEach(el => {
         try { Prism.highlightElement(el); } catch (e) {}
       });
