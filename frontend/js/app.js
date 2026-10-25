@@ -151,7 +151,19 @@ function fmtBytes(n) {
 function renderMarkdown(text) {
   try {
     const html = marked.parse(text || '', { breaks: true, gfm: true });
-    return { __html: DOMPurify.sanitize(html, { ADD_ATTR: ['target'] }) };
+    const safe = DOMPurify.sanitize(html, { ADD_ATTR: ['target'] });
+    // Prevent the browser from requesting nonexistent public /images paths.
+    // Images are authenticated workspace assets loaded after Markdown mounts.
+    const template = document.createElement('template');
+    template.innerHTML = safe;
+    for (const img of template.content.querySelectorAll('img[src]')) {
+      const relative = RdiRichContent.workspaceImagePath(img.getAttribute('src'));
+      if (!relative) continue;
+      img.removeAttribute('src');
+      img.setAttribute('data-rdi-workspace-path', relative);
+      img.hidden = true;
+    }
+    return { __html: template.innerHTML };
   } catch (e) {
     return { __html: DOMPurify.sanitize((text || '').replace(/</g, '&lt;')) };
   }
@@ -480,18 +492,21 @@ function ActivityPanel({ events = [], live = false, run = null }) {
 
 /* ── Message ───────────────────────────────────────────────────────────────── */
 
-function Message({ msg, onSpeak, onImageClick, streaming }) {
+function Message({ msg, onSpeak, onImageClick, streaming, conversationId }) {
   const bodyRef = useRef(null);
   useEffect(() => {
+    // Streaming text stays incremental. Parse charts, SVG and workspace images
+    // only when the completed fenced block is stable, avoiding repeated work.
+    if (streaming) return;
     const timer = setTimeout(() => {
       if (!bodyRef.current) return;
-      if (typeof RdiRichContent !== 'undefined') RdiRichContent.enhance(bodyRef.current);
+      RdiRichContent.enhance(bodyRef.current, conversationId, Auth.authHeaders());
       if (window.Prism) bodyRef.current.querySelectorAll('pre code').forEach(el => {
         try { Prism.highlightElement(el); } catch (e) {}
       });
-    }, streaming ? 200 : 0);
+    }, 0);
     return () => clearTimeout(timer);
-  }, [msg.content, streaming]);
+  }, [msg.content, streaming, conversationId]);
 
   if (msg.role === 'user') {
     return (
@@ -799,11 +814,13 @@ function ChatView(props) {
         <div className="chat-scroll" ref={scrollRef} onScroll={onScroll}>
           <div className="chat-inner">
             {messages.map((m, i) => (
-              <Message key={i} msg={m} onSpeak={speak} onImageClick={props.onImageClick} />
+              <Message key={i} msg={m} conversationId={conv}
+                       onSpeak={speak} onImageClick={props.onImageClick} />
             ))}
             {(busy || streamText || streamRun) && (
               <Message msg={{ role: 'assistant', content: streamText, run: streamRun,
                               activity, meta: modelName(model) }}
+                       conversationId={conv}
                        onSpeak={speak} onImageClick={props.onImageClick} streaming={busy} />
             )}
           </div>
