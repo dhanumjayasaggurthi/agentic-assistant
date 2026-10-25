@@ -101,5 +101,36 @@ class PermissionScopeTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("run_bash", stream.auto_allow_tools)
 
 
+class ReplayBufferIntegrityTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncTearDown(self):
+        _STREAMS.clear()
+
+    async def test_reconnect_recovers_full_response_after_2000_events(self):
+        class Socket:
+            def __init__(self):
+                self.events = []
+
+            async def send_json(self, payload):
+                self.events.append(dict(payload))
+
+        sock = Socket()
+        session = WSSession(sock, {"id": "u1"})
+        stream = StreamState("u1:long-answer")
+        _STREAMS[stream.key] = stream
+        stream.running = True
+        for index in range(2205):
+            await stream.emit({"type": "token", "text": f"{index} "})
+        await session._handle_resume({
+            "type": "resume", "conversation_id": "long-answer", "last_seq": 0,
+        })
+        ack = sock.events[0]
+        self.assertEqual(ack["type"], "resume_ok")
+        self.assertEqual(ack["replayed"], 0)
+        self.assertFalse(ack["reload_required"])
+        self.assertTrue(ack["snapshot"].startswith("0 1 2 "))
+        self.assertTrue(ack["snapshot"].endswith("2204 "))
+        self.assertEqual(len(ack["snapshot"].split()), 2205)
+
+
 if __name__ == "__main__":
     unittest.main()
