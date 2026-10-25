@@ -93,6 +93,8 @@ class StreamState:
         self.task: Optional[asyncio.Task] = None
 
     async def emit(self, data: dict) -> None:
+        # Route every live/replayed event to the conversation that produced it.
+        data = {**data, "conversation_id": self.key.split(":", 1)[1]}
         self.seq += 1
         data["seq"] = self.seq
         self.buffer.append(data)
@@ -137,6 +139,7 @@ class WSSession:
         self.model: str = "gpt-4o-global"
         self.history: List[Dict] = []
         self.auto_allow_readonly: bool = False
+        self._pending_tasks: Dict[str, asyncio.Task] = {}
         # Workspace settings cache (loaded lazily from DB)
         self._workspace_mode: Optional[str] = None
         self._workspace_custom_path: Optional[str] = None
@@ -236,10 +239,17 @@ class WSSession:
 
     async def handle(self, data: dict) -> None:
         t = data.get("type", "")
-        if t == "chat":
-            task = asyncio.create_task(self._handle_chat(data))
-            # The task is attached to the conversation stream once the
-            # conversation id is resolved inside _handle_chat.
+        if t in ("chat", "generate_image", "edit_image"):
+            handler = {"chat": self._handle_chat, "generate_image": self._handle_image,
+                       "edit_image": self._handle_edit_image}[t]
+            task = asyncio.create_task(handler(data))
+            request_id = data.get("request_id")
+            if request_id:
+                self._pending_tasks[request_id] = task
+                task.add_done_callback(
+                    lambda finished, rid=request_id: self._pending_tasks.pop(rid, None)
+                    if self._pending_tasks.get(rid) is finished else None
+                )
         elif t == "stop":
             await self._handle_stop(data)
         elif t == "permission":
@@ -263,10 +273,6 @@ class WSSession:
             await self._handle_list_conversations()
         elif t == "set_model":
             self.model = data.get("model", self.model)
-        elif t == "generate_image":
-            asyncio.create_task(self._handle_image(data))
-        elif t == "edit_image":
-            asyncio.create_task(self._handle_edit_image(data))
         elif t == "tts":
             asyncio.create_task(self._handle_tts(data))
         elif t == "transcribe":
@@ -332,7 +338,13 @@ class WSSession:
                 return
 
     async def _handle_stop(self, data: dict) -> None:
-        cid = data.get("conversation_id") or self.conversation_id
+        request_id = data.get("request_id")
+        pending = self._pending_tasks.get(request_id) if request_id else None
+        if pending and not pending.done():
+            pending.cancel()
+        # Explicit null means a not-yet-created conversation: never stop a
+        # different chat held in session.conversation_id.
+        cid = data.get("conversation_id") if "conversation_id" in data else self.conversation_id
         if not cid:
             return
         st = _STREAMS.get(_stream_key(self.user["id"], cid))
@@ -342,6 +354,7 @@ class WSSession:
         st.running = False
         if task and not task.done():
             task.cancel()
+        st.task = None
         await st.emit({"type": "cancelled", "message": "Run stopped by user."})
         await st.emit({"type": "activity_done"})
 
@@ -474,7 +487,7 @@ class WSSession:
     async def _handle_chat(self, data: dict) -> None:
         user_msg = data.get("message", "").strip()
         model = data.get("model", self.model)
-        cid = data.get("conversation_id") or self.conversation_id
+        cid = data.get("conversation_id") if "conversation_id" in data else self.conversation_id
         attachments = data.get("attachments", [])
 
         if not user_msg and not attachments:
@@ -487,7 +500,8 @@ class WSSession:
             conv = await create_conversation(self.user["id"], model)
             cid = conv["id"]
             self.conversation_id = cid
-            await self.send({"type": "conversation_created", "id": cid, "conversation": conv})
+            await self.send({"type": "conversation_created", "id": cid, "conversation": conv,
+                             "request_id": data.get("request_id")})
         else:
             owned = await get_conversation(cid, self.user["id"])
             if not owned:
@@ -496,7 +510,19 @@ class WSSession:
             await update_conversation_meta(cid, model=model)
 
         st = self._attach_stream(cid)
+        if st.running and st.task is not asyncio.current_task():
+            await st.emit({"type": "error", "message": "This conversation already has an active response."})
+            return
         st.task = asyncio.current_task()
+        st.running = True
+
+        # History belongs to this conversation, never to a mutable WebSocket session.
+        previous = await get_messages(cid)
+        history = trim_history([
+            {"role": m["role"], "content": m["content"],
+             "attachments": m.get("attachments") or []}
+            for m in previous
+        ])
 
         norm_atts = _normalize_attachments(attachments)
         attachment_ids = [
@@ -510,11 +536,8 @@ class WSSession:
         # Persist only handles/metadata; never persist another duplicate copy in
         # the message JSON when the attachment service already owns the content.
         await add_message(cid, "user", user_msg, attachments=norm_atts or None)
-        if len(self.history) == 0:
+        if not previous:
             await auto_title(cid, user_msg)
-
-        self.history.append({"role": "user", "content": user_msg, "attachments": norm_atts})
-        self.history = trim_history(self.history)
 
         agent_mode = bool(data.get("agent_mode", False))
         auto_agent = bool(data.get("auto_agent", True))
@@ -525,7 +548,8 @@ class WSSession:
                 "reason": "This request requires tools or workspace actions, so it was promoted to an agent run.",
             })
         if agent_mode:
-            await self._run_coding_agent(user_msg, model, cid, st, attachments=model_atts)
+            await self._run_coding_agent(user_msg, model, cid, st,
+                                         attachments=model_atts, history=history)
             return
 
         # ── Plain chat ────────────────────────────────────────────────────────
@@ -534,7 +558,7 @@ class WSSession:
         await st.emit({"type": "activity", "action": "Connecting to model…", "icon": "🔗"})
 
         sys_prefix = await self._cross_chat_prefix(cid)
-        hydrated_history = await self._hydrate_history(self.history[:-1])
+        hydrated_history = await self._hydrate_history(history)
         messages = build_messages(hydrated_history, user_msg, model_atts or None,
                                   system_prefix=sys_prefix)
         full_response = ""
@@ -543,17 +567,17 @@ class WSSession:
             full_response = await self._stream_with_retry(st, messages, model)
         except Exception as exc:
             st.running = False
+            st.task = None
             await st.emit({"type": "error", "message": f"Model error: {exc}"})
             await st.emit({"type": "activity_done"})
             return
 
         latency = int((time.time() - t0) * 1000)
+        await add_message(cid, "assistant", full_response)
+        st.running = False
+        st.task = None
         await st.emit({"type": "done", "latency_ms": latency})
         await st.emit({"type": "activity_done"})
-        st.running = False
-
-        await add_message(cid, "assistant", full_response)
-        self.history.append({"role": "assistant", "content": full_response})
 
         input_chars = sum(len(str(m.get("content", ""))) for m in messages)
         await record_usage(
@@ -604,7 +628,8 @@ class WSSession:
     # ── Coding agent (checkpointed run) ───────────────────────────────────────
 
     async def _run_coding_agent(self, user_msg: str, model: str, cid: str,
-                                st: StreamState, attachments: list = None) -> None:
+                                st: StreamState, attachments: list = None,
+                                history: list = None) -> None:
         t0 = time.time()
         full_response = ""
         await self._load_ws_settings()
@@ -835,7 +860,7 @@ class WSSession:
         cancelled = False
         err_text = None
         try:
-            hydrated_history = await self._hydrate_history(self.history[:-1])
+            hydrated_history = await self._hydrate_history((history or []))
             await run_coding_agent(
                 enriched_msg, hydrated_history, run_model,
                 permission_fn=_perm_fn,
@@ -858,14 +883,14 @@ class WSSession:
         st.task = None
         latency = int((time.time() - t0) * 1000)
 
-        input_chars = sum(len(str(m.get("content", ""))) for m in self.history[:-1])
+        input_chars = sum(len(str(m.get("content", ""))) for m in (history or []))
         in_toks = max(1, input_chars // 4)
         out_toks = max(1, len(full_response) // 4)
 
         if cancelled:
             if full_response:
                 await add_message(cid, "assistant", full_response)
-                self.history.append({"role": "assistant", "content": full_response})
+
             await finish_run(run_id, "cancelled", in_toks, out_toks, 0.0, error=err_text)
             await st.emit({"type": "run_step", "run_id": run_id,
                            "steps": _public_steps(steps), "final": "cancelled"})
@@ -874,7 +899,7 @@ class WSSession:
         if agent_failed:
             if full_response:
                 await add_message(cid, "assistant", full_response)
-                self.history.append({"role": "assistant", "content": full_response})
+
             await finish_run(run_id, "error", in_toks, out_toks, 0.0, error=err_text)
             await st.emit({"type": "run_step", "run_id": run_id,
                            "steps": _public_steps(steps), "final": "error"})
@@ -884,7 +909,6 @@ class WSSession:
         await st.emit({"type": "done", "latency_ms": latency})
         await st.emit({"type": "activity_done"})
         await add_message(cid, "assistant", full_response)
-        self.history.append({"role": "assistant", "content": full_response})
 
         telemetry_emit(
             "agent_run_completed",
@@ -935,12 +959,13 @@ class WSSession:
         if doc_context:
             gen_prompt = f"{prompt}\n\nReference context:\n{doc_context}"
 
-        cid = data.get("conversation_id") or self.conversation_id
+        cid = data.get("conversation_id") if "conversation_id" in data else self.conversation_id
         if not cid:
             conv = await create_conversation(self.user["id"], model)
             cid = conv["id"]
             self.conversation_id = cid
-            await self.send({"type": "conversation_created", "id": cid, "conversation": conv})
+            await self.send({"type": "conversation_created", "id": cid, "conversation": conv,
+                             "request_id": data.get("request_id")})
         first_msg = len(await get_messages(cid)) == 0
 
         st = self._attach_stream(cid)
