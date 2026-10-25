@@ -1298,6 +1298,7 @@ function App() {
   const streamImagesRef = useRef([]);
   const activityRef = useRef([]);
   const pendingRequestRef = useRef(null);
+  const uploadControllersRef = useRef(new Map());
   const loadTargetRef = useRef(null);
   const busyRef = useRef(false);
   const modelRef = useRef(model);
@@ -1563,6 +1564,9 @@ function App() {
       RdiWS.send({ type: 'stop', conversation_id: oldId, request_id: oldRequest });
     }
     pendingRequestRef.current = null;
+    for (const controller of uploadControllersRef.current.values()) controller.abort();
+    uploadControllersRef.current.clear();
+    setAttachments([]);
     loadTargetRef.current = null;
     busyRef.current = false;
     convRef.current = null;
@@ -1611,7 +1615,10 @@ function App() {
     const form = new FormData();
     form.append('file', file);
     if (convRef.current) form.append('conversation_id', convRef.current);
-    fetch('/files/upload', { method: 'POST', headers: Auth.authHeaders(), body: form })
+    const controller = new AbortController();
+    uploadControllersRef.current.set(key, controller);
+    fetch('/files/upload', { method: 'POST', headers: Auth.authHeaders(),
+                             body: form, signal: controller.signal })
       .then(async response => {
         const payload = await response.json().catch(() => ({}));
         if (!response.ok) {
@@ -1629,8 +1636,13 @@ function App() {
             content_type: d.content_type,
             size: d.size,
           } } : a)))
-      .catch(err => setAttachments(list => list.map(a => a.key === key
-        ? { ...a, status: 'failed', error: err.message } : a)));
+      .catch(err => {
+        if (err.name !== 'AbortError') {
+          setAttachments(list => list.map(a => a.key === key
+            ? { ...a, status: 'failed', error: err.message } : a));
+        }
+      })
+      .finally(() => uploadControllersRef.current.delete(key));
   }, []);
 
   useEffect(() => {
