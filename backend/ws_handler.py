@@ -206,15 +206,31 @@ class WSSession:
                 "size": row.get("size_bytes") or ref.get("size") or 0,
                 "storage_path": row.get("storage_path"),
             }
+            storage_path = row.get("storage_path")
+            base = self._ws_base().resolve()
+            original = (base / storage_path).resolve() if storage_path else None
+            authorized = original is not None and original.is_file() and original.is_relative_to(base)
             if content_type.startswith("image/"):
-                storage_path = row.get("storage_path")
-                if storage_path:
-                    p = (self._ws_base() / storage_path).resolve()
-                    base = self._ws_base().resolve()
-                    if p.is_file() and (p == base or p.is_relative_to(base)):
-                        item["content"] = base64.b64encode(p.read_bytes()).decode()
+                if authorized:
+                    item["content"] = base64.b64encode(original.read_bytes()).decode()
             else:
-                item["content"] = row.get("content") or ""
+                # Most legacy attachments kept text in the DB. Modern uploads
+                # have full extracted UTF-8 sidecars, with original bytes intact.
+                sidecar = original.parent / "extracted.txt" if authorized else None
+                manifest = original.parent / "manifest.json" if authorized else None
+                if manifest and manifest.is_file():
+                    try:
+                        item["extraction"] = json.loads(manifest.read_text(encoding="utf-8"))
+                    except (ValueError, OSError):
+                        item["extraction"] = {"complete": False, "note": "Extraction metadata unavailable"}
+                if sidecar and sidecar.is_file():
+                    item["extracted_path"] = str(sidecar)
+                    if sidecar.stat().st_size <= 12_000:
+                        item["content"] = sidecar.read_text(encoding="utf-8")
+                    else:
+                        item["content"] = ""
+                else:
+                    item["content"] = row.get("content") or ""
             hydrated.append(item)
         return hydrated
 
