@@ -37,9 +37,17 @@ class _Sink:
         self.file.close()
 
 
-def _read_text(path: Path, sink: _Sink):
-    # newline-preserving streaming decode; binary formats never enter this route.
-    with path.open("r", encoding="utf-8-sig", errors="replace", newline="") as src:
+def _text_encoding(path: Path) -> str:
+    with path.open("rb") as src:
+        bom = src.read(4)
+    return "utf-16" if bom.startswith((b"\\xff\\xfe", b"\\xfe\\xff")) else "utf-8-sig"
+
+
+def _read_text(path: Path, sink: _Sink, replace_errors: bool = False):
+    # Use strict decoding first. Any fallback replacement is explicitly
+    # reported in the manifest; the original remains byte-for-byte intact.
+    with path.open("r", encoding=_text_encoding(path),
+                   errors="replace" if replace_errors else "strict", newline="") as src:
         for line in src:
             sink.write(line)
 
@@ -141,7 +149,18 @@ def extract_attachment(path: Path, content_type: str, budget: int = MAX_EXTRACTE
             if kind == "archive_inventory" else "")
     try:
         handler(path, sink)
-    except (ExtractionLimit, Exception) as exc:
+    except UnicodeDecodeError:
+        complete = False
+        note = ("Some bytes could not be decoded as Unicode and were replaced "
+                "in the extracted view. Original bytes are retained for exact analysis.")
+        sink.file.seek(0)
+        sink.file.truncate(0)
+        sink.written = 0
+        try:
+            _read_text(path, sink, replace_errors=True)
+        except Exception as exc:
+            note += f" Fallback extraction error: {exc}"
+    except Exception as exc:
         complete = False
         note = f"{type(exc).__name__}: {exc}. Original retained for direct analysis."
     finally:
