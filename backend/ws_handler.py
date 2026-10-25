@@ -325,7 +325,7 @@ class WSSession:
         st.session = self
         replay = st.replay_after(last_seq)
         await self.send({
-            "type": "resume_ok",
+            "type": "resume_ok", "conversation_id": cid,
             "running": st.running,
             "replayed": len(replay),
             "current_seq": st.seq,
@@ -393,6 +393,11 @@ class WSSession:
         if st is not None:
             st.session = self
         run = await get_latest_run(cid)
+        partial_text = "".join(ev.get("text", "") for ev in st.buffer if ev.get("type") == "token") if st and st.running else ""
+        activity_log = [
+            {"action": ev.get("action", "Working…"), "icon": ev.get("icon", "·")}
+            for ev in st.buffer if ev.get("type") == "activity"
+        ][-16:] if st and st.running else []
         await self.send({
             "type": "conversation_loaded",
             "conversation": conv,
@@ -400,6 +405,8 @@ class WSSession:
             "cross_chat_reference": self.cross_chat_reference,
             "running": bool(st.running) if st else False,
             "current_seq": st.seq if st else 0,
+            "partial_text": partial_text,
+            "activity_log": activity_log,
             "last_run": run,
         })
 
@@ -565,6 +572,14 @@ class WSSession:
         try:
             await st.emit({"type": "activity", "action": "Streaming response…", "icon": "💬"})
             full_response = await self._stream_with_retry(st, messages, model)
+        except asyncio.CancelledError:
+            # Keep actually generated partial text when a user presses Stop.
+            partial = "".join(ev.get("text", "") for ev in st.buffer if ev.get("type") == "token")
+            if partial:
+                await add_message(cid, "assistant", partial)
+            st.running = False
+            st.task = None
+            return
         except Exception as exc:
             st.running = False
             st.task = None
@@ -875,7 +890,6 @@ class WSSession:
         except Exception as exc:
             agent_failed = True
             err_text = str(exc)
-            await st.emit({"type": "error", "message": f"Coding agent error: {exc}"})
         finally:
             _workspace_var.reset(_tok)
 
@@ -903,11 +917,10 @@ class WSSession:
             await finish_run(run_id, "error", in_toks, out_toks, 0.0, error=err_text)
             await st.emit({"type": "run_step", "run_id": run_id,
                            "steps": _public_steps(steps), "final": "error"})
+            await st.emit({"type": "error", "message": f"Coding agent error: {err_text}"})
             await st.emit({"type": "activity_done"})
             return
 
-        await st.emit({"type": "done", "latency_ms": latency})
-        await st.emit({"type": "activity_done"})
         await add_message(cid, "assistant", full_response)
 
         telemetry_emit(
@@ -924,6 +937,8 @@ class WSSession:
         await finish_run(run_id, "done", in_toks, out_toks, 0.0)
         await st.emit({"type": "run_step", "run_id": run_id,
                        "steps": _public_steps(steps), "final": "done"})
+        await st.emit({"type": "done", "latency_ms": latency})
+        await st.emit({"type": "activity_done"})
 
     # ── Permission response ───────────────────────────────────────────────────
 
