@@ -23,7 +23,9 @@ const RdiRichContent = (() => {
   }
 
   function parseChart(code, language = '') {
-    if (!['chart', 'chartjs', 'json'].includes(language)) return null;
+    // LLMs may use json, chart, javascript or no fence language for strict JSON.
+    // Parsing remains JSON-only: never evaluate arbitrary JavaScript.
+    if (!['chart', 'chartjs', 'json', 'javascript', ''].includes(language)) return null;
     let config;
     try { config = JSON.parse(code); }
     catch (_) {
