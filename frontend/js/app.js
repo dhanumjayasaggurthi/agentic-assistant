@@ -548,7 +548,15 @@ function Message({ msg, onSpeak, onImageClick, streaming, conversationId }) {
     );
   }
 
-  const images = (msg.attachments || []).filter(a => (a.type || '').startsWith('image'));
+  const images = (msg.attachments || []).filter(a => {
+    if (!(a.type || '').startsWith('image')) return false;
+    // A generated image referenced inline by Markdown must not be repeated
+    // as a second standalone asset card in the same response.
+    if (!a.path || !msg.content) return true;
+    return !['](' + a.path + ')', '](/' + a.path + ')',
+             '](workspace/' + a.path + ')', '](/workspace/' + a.path + ')']
+      .some(marker => msg.content.includes(marker));
+  });
   const resolveImage = async image => {
     if (image.content) return image;
     const blob = await RdiRichContent.fetchWorkspaceImage(
@@ -1456,7 +1464,7 @@ function App() {
       const name = d.filename || `generated_${Date.now()}.png`;
       if (d.from_agent && d.base64) {
         streamImagesRef.current = [...streamImagesRef.current,
-          { name, type: 'image/png', content: d.base64 }];
+          { name, type: 'image/png', path: 'images/' + name, content: d.base64 }];
         setStreamImages(streamImagesRef.current);
         return;
       }
@@ -1511,7 +1519,10 @@ function App() {
     if (text || run || streamImagesRef.current.length) {
       setMessages(ms => [...ms, {
         role: 'assistant', content: text, run, activity: activityRef.current,
-        attachments: streamImagesRef.current,
+        // Image bytes already live in the private workspace. Persist URLs,
+        // not a second copy of multi-megabyte base64 in React history.
+        attachments: streamImagesRef.current.map(({ name, type, path, content }) =>
+          path ? { name, type, path } : { name, type, content }),
         meta: modelName(modelRef.current),
       }]);
     }
