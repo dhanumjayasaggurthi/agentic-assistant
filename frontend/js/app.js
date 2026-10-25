@@ -528,7 +528,7 @@ function Message({ msg, onSpeak, onImageClick, streaming }) {
       {(msg.content || streaming) && <div className="msg-body" ref={bodyRef}>
         {msg.content && <div className="msg-markdown" dangerouslySetInnerHTML={renderMarkdown(msg.content)} />}
         {streaming && !msg.content && <span className="msg-pending">Response in progress…</span>}
-        {streaming && <span className="stream-caret" aria-hidden="true" />}
+        {streaming && !!msg.content && <span className="stream-caret" aria-hidden="true" />}
       </div>}
       {!streaming && msg.content && (
         <div className="msg-actions">
@@ -703,7 +703,7 @@ function ChatView(props) {
   useEffect(() => {
     const el = scrollRef.current;
     if (el && pinnedRef.current) el.scrollTop = el.scrollHeight;
-  }, [messages, streamText, streamRun]);
+  }, [messages, streamText, streamRun, activity, busy]);
 
   const onScroll = () => {
     const el = scrollRef.current; if (!el) return;
