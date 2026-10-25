@@ -54,7 +54,7 @@ from .telemetry import emit as telemetry_emit
 
 # Activity icons per tool
 _TOOL_ICONS: Dict[str, str] = {
-    "read_file": "📄", "write_file": "✏️", "create_file": "📝",
+    "read_file": "📄", "file_overview": "📊", "write_file": "✏️", "create_file": "📝",
     "patch_file": "🩹", "inspect_image": "👁️", "delegate_code": "🧠",
     "delete_file": "🗑️", "list_files": "📁", "run_bash": "⚡",
     "run_python": "🐍", "search_files": "🔍", "create_pdf": "📑",
@@ -63,7 +63,7 @@ _TOOL_ICONS: Dict[str, str] = {
 }
 
 # Tools that never mutate anything — eligible for auto-approval.
-READONLY_TOOLS = {"read_file", "list_files", "search_files", "web_search", "web_crawl", "inspect_image"}
+READONLY_TOOLS = {"read_file", "file_overview", "list_files", "search_files", "web_search", "web_crawl", "inspect_image"}
 
 # Tools that produce files — their outputs get registered as artifacts.
 FILE_TOOLS = {"write_file", "create_file", "patch_file", "create_pdf", "create_pptx",
