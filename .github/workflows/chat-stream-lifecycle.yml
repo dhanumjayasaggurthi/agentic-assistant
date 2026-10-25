@@ -1,0 +1,42 @@
+name: Chat streaming and lifecycle regression
+
+on:
+  push:
+    branches:
+      - fix/chat-stream-progress-conversation-isolation-20261025
+  pull_request:
+    branches:
+      - feature/chatgpt-parity-phase2-2026-09-27
+
+jobs:
+  chat-regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install runtime test dependencies
+        run: pip install -r requirements.txt
+      - name: Compile all Python sources
+        run: python -m compileall -q backend tests
+      - name: Run all existing and new unit tests
+        run: python -m unittest discover -s tests -v
+      - name: Check browser WebSocket client and test syntax
+        run: |
+          node --check frontend/js/ws.js
+          node --check tests/chat_websocket_100.test.js
+          node tests/chat_websocket_100.test.js
+      - name: Compile frontend JSX (syntax and structure)
+        run: |
+          npx --yes esbuild@0.25.12 frontend/js/app.js --loader:.js=jsx --outfile=/tmp/rdi-app-syntax-check.js
+      - name: Repeat concurrency and stream lifecycle tests 100 times
+        run: |
+          for i in $(seq 1 100); do
+            python -m unittest discover -s tests -p "test_chat_stream_lifecycle.py" -q >/dev/null
+          done
+          echo "PASS: 100 lifecycle test suite executions"
